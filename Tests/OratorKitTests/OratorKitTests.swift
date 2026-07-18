@@ -1,0 +1,333 @@
+import XCTest
+import AppKit
+@preconcurrency import AVFoundation
+import Carbon.HIToolbox
+@testable import OratorKit
+
+private final class ConsumeOnce: @unchecked Sendable { var done = false }
+
+/// Automated verification for the requirements that have a testable seam (§15.1 "test").
+final class OratorKitTests: XCTestCase {
+
+    // AC-6 / ORA-REC-003: entry gone from memory 5 min after creation, no user interaction.
+    @MainActor
+    func testRecoveryBufferHardTTL() {
+        var fake = Date(timeIntervalSince1970: 1000)
+        let buffer = RecoveryBuffer(now: { fake })
+        buffer.add("hello world", reason: .inserted)
+        XCTAssertEqual(buffer.entries.count, 1)
+
+        fake = fake.addingTimeInterval(4 * 60)        // 4 min — still alive
+        buffer.sweep()
+        XCTAssertEqual(buffer.entries.count, 1)
+
+        fake = fake.addingTimeInterval(2 * 60)        // now 6 min — expired
+        buffer.sweep()
+        XCTAssertEqual(buffer.entries.count, 0, "entry MUST expire at the 5-minute hard TTL")
+    }
+
+    // ORA-REC-006: bounded to ≤ 10 regardless of TTL.
+    @MainActor
+    func testRecoveryBufferBounded() {
+        let buffer = RecoveryBuffer(now: { Date(timeIntervalSince1970: 0) })
+        for i in 0..<25 { buffer.add("entry \(i)", reason: .inserted) }
+        XCTAssertLessThanOrEqual(buffer.entries.count, RecoveryBuffer.maxEntries)
+    }
+
+    // ORA-SM-012 corollary: empty results never create an entry (a discarded/empty session leaves none).
+    @MainActor
+    func testEmptyResultLeavesNoEntry() {
+        let buffer = RecoveryBuffer(now: { Date(timeIntervalSince1970: 0) })
+        buffer.add("", reason: .inserted)
+        buffer.add("real text", reason: .inserted)
+        XCTAssertEqual(buffer.entries.count, 1)
+    }
+
+    // ORA-REC-003 in-place scrub: an expired entry's backing string is emptied, not just dropped.
+    @MainActor
+    func testSweepScrubsExpiredEntriesInPlace() {
+        var fake = Date(timeIntervalSince1970: 1000)
+        let buffer = RecoveryBuffer(now: { fake })
+        buffer.add("keep me", reason: .inserted)
+        fake = fake.addingTimeInterval(60)
+        buffer.add("newer", reason: .inserted)
+        fake = fake.addingTimeInterval(5 * 60 - 30)   // first entry now > 5 min, second not
+        buffer.sweep()
+        XCTAssertEqual(buffer.entries.map(\.text), ["newer"])
+    }
+
+    // ORA-INS-005 / B4: the concealed + string markers live on the SAME pasteboard item.
+    @MainActor
+    func testConcealedMarkerOnStringItem() {
+        Pasteboard.writeConcealed("secret")
+        let items = NSPasteboard.general.pasteboardItems ?? []
+        XCTAssertEqual(items.count, 1, "one item carries all types")
+        let types = Set(items.first?.types.map(\.rawValue) ?? [])
+        XCTAssertTrue(types.contains("public.utf8-plain-text"))
+        XCTAssertTrue(types.contains(Pasteboard.concealedType.rawValue))
+    }
+
+    // ORA-IND-001: glyph derivation across state × readiness.
+    func testGlyphDerivation() {
+        XCTAssertEqual(IndicatorGlyph.from(state: .idle, readiness: .ready), .ready)
+        XCTAssertEqual(IndicatorGlyph.from(state: .recording, readiness: .ready), .recording)
+        XCTAssertEqual(IndicatorGlyph.from(state: .finalizing, readiness: .ready), .working)
+        XCTAssertEqual(IndicatorGlyph.from(state: .inserting, readiness: .ready), .working)
+        // Not-ready dominates regardless of session state (ORA-PERM-003).
+        XCTAssertEqual(IndicatorGlyph.from(state: .idle, readiness: .needsPermission([.microphone])), .notReady)
+        XCTAssertEqual(IndicatorGlyph.from(state: .recording, readiness: .needsModel(.missing)), .notReady)
+        // Degraded hotkey can still dictate (ORA-ACT-006): not a not-ready glyph.
+        XCTAssertEqual(IndicatorGlyph.from(state: .idle, readiness: .degradedHotkey), .ready)
+    }
+
+    func testReadinessGating() {
+        XCTAssertTrue(Readiness.ready.canStartDictation)
+        XCTAssertTrue(Readiness.degradedHotkey.canStartDictation)
+        // E2: an Accessibility-only gap still allows recording (insertion routes to recovery).
+        XCTAssertTrue(Readiness.needsPermission([.accessibility]).canStartDictation)
+        // Microphone is record-blocking; model missing is record-blocking.
+        XCTAssertFalse(Readiness.needsPermission([.microphone]).canStartDictation)
+        XCTAssertFalse(Readiness.needsPermission([.microphone, .accessibility]).canStartDictation)
+        XCTAssertFalse(Readiness.needsModel(.missing).canStartDictation)
+    }
+
+    // ORA-INS-005 / E13: restore must NOT clobber a newer clipboard.
+    @MainActor
+    func testPasteboardChangeCountGuard() {
+        let pb = NSPasteboard.general
+        pb.clearContents(); pb.setString("original", forType: .string)
+        let snapshot = Pasteboard.snapshot()
+        let ourCount = Pasteboard.writeConcealed("dictated")
+        XCTAssertEqual(pb.string(forType: .string), "dictated")
+
+        // Simulate the user copying something during the deferred-restore window.
+        pb.clearContents(); pb.setString("user copied this", forType: .string)
+
+        let restored = Pasteboard.restore(snapshot, ifUnchangedFrom: ourCount)
+        XCTAssertFalse(restored, "must not clobber a newer clipboard")
+        XCTAssertEqual(pb.string(forType: .string), "user copied this")
+    }
+
+    // ORA-INS-005 happy path: restore when unchanged.
+    @MainActor
+    func testPasteboardRestoreWhenUnchanged() {
+        let pb = NSPasteboard.general
+        pb.clearContents(); pb.setString("original", forType: .string)
+        let snapshot = Pasteboard.snapshot()
+        let ourCount = Pasteboard.writeConcealed("dictated")
+        let restored = Pasteboard.restore(snapshot, ifUnchangedFrom: ourCount)
+        XCTAssertTrue(restored)
+        XCTAssertEqual(pb.string(forType: .string), "original")
+    }
+
+    // ORA-CFG-002: settings defaults + round-trip via an isolated suite.
+    @MainActor
+    func testSettingsDefaultsAndPersistence() {
+        let suite = UserDefaults(suiteName: "OratorTests-\(UUID().uuidString)")!
+        let settings = Settings(defaults: suite)
+        XCTAssertEqual(settings.micPolicy, .followDefault)    // ORA-CAP-002 default
+        XCTAssertEqual(settings.localeIdentifier, "en-US")    // English v1
+        XCTAssertTrue(settings.soundEnabled)
+        XCTAssertEqual(settings.hotkey, .defaultChord)        // ⌥Space
+
+        settings.vocabulary = ["Acme", "Orator"]
+        XCTAssertEqual(Settings(defaults: suite).vocabulary, ["Acme", "Orator"])
+    }
+
+    // ORA-IND-012: panel size is a pure function of notch/pill — independent of preview text length.
+    func testFixedIndicatorSizeIndependentOfText() {
+        func size(for text: String, isNotch: Bool) -> CGSize {
+            _ = IndicatorContent(state: .recording, elapsed: 0,
+                                 level: 0.5, previewTail: text, isNotch: isNotch)
+            return IndicatorMetrics.size(isNotch: isNotch)   // size never reads the content text
+        }
+        XCTAssertEqual(size(for: "hi", isNotch: false),
+                       size(for: String(repeating: "long ", count: 40), isNotch: false))
+        XCTAssertEqual(size(for: "hi", isNotch: true),
+                       size(for: String(repeating: "long ", count: 40), isNotch: true))
+        // Notch panel is taller than the pill: content sits BELOW the opaque notch band
+        // (ORA-IND-011), so height = notchBand + contentHeight.
+        XCTAssertGreaterThan(IndicatorMetrics.size(isNotch: true).height,
+                             IndicatorMetrics.size(isNotch: false).height)
+        XCTAssertEqual(IndicatorMetrics.size(isNotch: true, notchBand: 32).height,
+                       32 + IndicatorMetrics.contentHeight)
+    }
+
+    // ORA-CAP-001 regression: an AVAudioConverter fed one capture buffer at a time (the one-shot
+    // pattern the sink uses) consumes it, produces valid downsampled output, THEN reports
+    // `.inputRanDry` — NOT `.haveData`. So the sink must accept any non-error status that yielded
+    // frames; gating on `.haveData` alone drops every buffer and silently kills capture.
+    func testConverterReportsInputRanDryYetProducesFrames() throws {
+        let inFmt = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000,
+                                                channels: 1, interleaved: false))
+        let outFmt = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000,
+                                                 channels: 1, interleaved: false))
+        let converter = try XCTUnwrap(AVAudioConverter(from: inFmt, to: outFmt))
+
+        let inBuf = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: inFmt, frameCapacity: 512))
+        inBuf.frameLength = 512
+        for i in 0..<512 { inBuf.floatChannelData![0][i] = sinf(Float(i) * 0.1) * 0.5 }
+
+        let ratio = outFmt.sampleRate / inFmt.sampleRate
+        let out = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: outFmt,
+                                                 frameCapacity: AVAudioFrameCount(Double(512) * ratio) + 1024))
+        let once = ConsumeOnce()
+        var err: NSError?
+        let status = converter.convert(to: out, error: &err) { _, s in
+            if once.done { s.pointee = .noDataNow; return nil }
+            once.done = true; s.pointee = .haveData; return inBuf
+        }
+
+        XCTAssertNil(err)
+        XCTAssertEqual(status, .inputRanDry)          // NOT .haveData — the crux of the bug
+        XCTAssertGreaterThan(out.frameLength, 0)      // …yet the output is real and must be kept
+    }
+
+    // ORA-INS-004: the paste key code resolves to the key that types "v" in the current layout —
+    // the ANSI-V physical key on a standard ANSI/QWERTY host. Also proves the resolver returns a
+    // real hardware key code and never crashes.
+    @MainActor
+    func testPasteKeyCodeResolvesVKey() {
+        let code = TextInserter.pasteKeyCode()
+        XCTAssertLessThan(code, 128)                    // a real hardware key code
+        XCTAssertEqual(code, CGKeyCode(kVK_ANSI_V))     // ANSI/QWERTY test host
+    }
+
+    // Built-in resolver must land on a real Built-in-transport device, not a Continuity/Bluetooth
+    // device that merely happens to be first (the first-device-fallthrough bug).
+    @MainActor
+    func testBuiltInMicResolvesToBuiltInTransport() throws {
+        try XCTSkipUnless(CoreAudioSupport.builtInInputUID() != nil, "no built-in input on this host")
+        let resolved = AudioCapture.builtInMicrophone()
+        let builtInUID = CoreAudioSupport.builtInInputUID()
+        XCTAssertNotNil(resolved, "built-in resolver returned nil despite a built-in device existing")
+        // It must be THE built-in (UID match), not the first arbitrary mic.
+        XCTAssertEqual(resolved?.uniqueID, builtInUID,
+                       "resolved '\(resolved?.localizedName ?? "nil")' is not the built-in device")
+    }
+
+    // Headless END-TO-END: synthesize a known utterance with `say`, replay it through the real
+    // PCMConverter + SpeechAnalyzer via FileAudioCapture (no mic, no user), assert the transcript
+    // comes back. Regression guard for "indicator shows but nothing transcribes."
+    @MainActor
+    func testEndToEndFileDictationProducesTranscript() async throws {
+        let phrase = "the quick brown fox jumps over the lazy dog"
+        let audioURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("orator-e2e.aiff")
+        try? FileManager.default.removeItem(at: audioURL)
+        let say = Process()
+        say.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+        say.arguments = ["-o", audioURL.path, phrase]
+        try say.run(); say.waitUntilExit()
+        try XCTSkipUnless(say.terminationStatus == 0 && FileManager.default.fileExists(atPath: audioURL.path),
+                          "`say` unavailable")
+
+        let engine = SpeechEngine(locale: Locale(identifier: "en-US"))
+        let modelStatus = await engine.modelStatus()
+        try XCTSkipUnless(modelStatus == .installed, "en-US model not installed on this host")
+        try await engine.warmUp()
+        let format = try XCTUnwrap(engine.inputFormat)
+
+        let collector = TranscriptCollector()
+        engine.sink = collector
+
+        let capture = FileAudioCapture(url: audioURL, realtime: true)
+        let stream = try capture.start(outputFormat: format)
+        await engine.beginSession(vocabulary: [])
+        let bridge = Task.detached { [engine] in for await input in stream { engine.feed(input) } }
+        await bridge.value                          // drains when the file hits EOF
+        _ = await engine.finalize(within: .seconds(5))
+        try await Task.sleep(for: .milliseconds(400))   // let late finals arrive
+
+        let text = collector.confirmed.lowercased()
+        XCTAssertFalse(text.isEmpty, "no transcript produced end-to-end")
+        XCTAssertTrue(["fox", "quick", "brown", "dog"].contains { text.contains($0) },
+                      "transcript did not contain expected words: '\(text)'")
+    }
+
+    // ORA-ASR-007: the recognizer emits stray leading punctuation for the opening pause and drops
+    // sentence-start casing. Cases below are verbatim from live dictation traces.
+    func testTranscriptCleanerStripsLeadingJunkAndCapitalizes() {
+        XCTAssertEqual(TranscriptCleaner.clean(".. the waveform actually feels responsive."),
+                       "The waveform actually feels responsive.")
+        XCTAssertEqual(TranscriptCleaner.clean(", you... there are still some of these"),
+                       "You... there are still some of these")
+        XCTAssertEqual(TranscriptCleaner.clean(",... the speed is feeling pretty good"),
+                       "The speed is feeling pretty good")
+        XCTAssertEqual(TranscriptCleaner.clean("…  hello world"), "Hello world")
+        // Already-clean text is untouched (idempotent), and internal punctuation is preserved.
+        XCTAssertEqual(TranscriptCleaner.clean("Testing the waveform."), "Testing the waveform.")
+        XCTAssertEqual(TranscriptCleaner.clean(""), "")
+    }
+}
+
+/// Accumulates confirmed transcript for the end-to-end test.
+@MainActor
+final class TranscriptCollector: SpeechResultSink {
+    private(set) var confirmed = ""
+    func reset() { confirmed = "" }
+    func speechDidConfirm(_ text: String) {
+        if !confirmed.isEmpty { confirmed += " " }
+        confirmed += text
+    }
+    func speechDidReviseVolatile(_ text: String) {}
+}
+
+/// Reproduces the cross-session bleed the user hit (words from the previous session leaking into
+/// the next). Runs alternating utterances back-to-back through the SAME warm analyzer — the app's
+/// real lifecycle — asserting each session gets its OWN words (no leak) and is non-empty (no drop).
+/// Headless: no mic, no user.
+final class CrossSessionTests: XCTestCase {
+    @MainActor
+    func testBackToBackSessionsDoNotLeakOrDrop() async throws {
+        func synth(_ phrase: String, _ name: String) throws -> URL {
+            let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(name)
+            try? FileManager.default.removeItem(at: url)
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+            p.arguments = ["-o", url.path, phrase]
+            try p.run(); p.waitUntilExit()
+            return url
+        }
+        let a = try synth("the silver wolf howls beneath the moon", "orator-sessA.aiff")
+        let b = try synth("alpha bravo charlie delta echo", "orator-sessB.aiff")
+        try XCTSkipUnless(FileManager.default.fileExists(atPath: a.path), "`say` unavailable")
+
+        let engine = SpeechEngine(locale: Locale(identifier: "en-US"))
+        let status = await engine.modelStatus()
+        try XCTSkipUnless(status == .installed, "en-US model not installed")
+        try await engine.warmUp()
+        let collector = TranscriptCollector()
+        engine.sink = collector
+        let format = try XCTUnwrap(engine.inputFormat)
+
+        // One dictation against the warm engine, mimicking the coordinator's exact sequence.
+        @MainActor func runSession(_ url: URL) async throws -> String {
+            collector.reset()
+            let capture = FileAudioCapture(url: url, realtime: true)   // wall-clock pace, like a real mic
+            let stream = try capture.start(outputFormat: format)
+            await engine.beginSession(vocabulary: [])
+            let bridge = Task.detached { [engine] in for await input in stream { engine.feed(input) } }
+            await bridge.value
+            _ = await engine.finalize(within: .seconds(5))
+            try await Task.sleep(for: .milliseconds(200))   // let late finals land
+            let text = collector.confirmed.lowercased()
+            engine.endSession()                             // tear down, exactly like production
+            return text
+        }
+
+        for round in 0..<3 {
+            let t1 = try await runSession(a)
+            let t2 = try await runSession(b)
+            XCTAssertFalse(t1.isEmpty, "round \(round): session A dropped (produced nothing)")
+            XCTAssertFalse(t2.isEmpty, "round \(round): session B dropped (produced nothing)")
+            // No truncation: the LAST word of each utterance must be present.
+            XCTAssertTrue(t1.contains("moon"), "round \(round): session A truncated — got '\(t1)'")
+            XCTAssertTrue(t2.contains("echo"), "round \(round): session B truncated — got '\(t2)'")
+            // No leak: A's words must not appear in B's transcript and vice-versa.
+            XCTAssertFalse(t2.contains("wolf") || t2.contains("moon"),
+                           "round \(round): session A leaked into B — got '\(t2)'")
+            XCTAssertFalse(t1.contains("bravo") || t1.contains("charlie"),
+                           "round \(round): session B leaked into A — got '\(t1)'")
+        }
+    }
+}

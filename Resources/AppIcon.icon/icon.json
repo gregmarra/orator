@@ -1,0 +1,19 @@
+{
+  "fill" : { "automatic-gradient" : "extended-srgb:0.13000,0.13000,0.16000,1.00000" },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "glass" : true,
+          "hidden" : false,
+          "image-name" : "waveform.png",
+          "name" : "waveform",
+          "position" : { "scale" : 1.00000, "translation-in-points" : [ 0, 0 ] }
+        }
+      ],
+      "shadow" : { "kind" : "neutral", "opacity" : 0.5 },
+      "translucency" : { "enabled" : true, "value" : 0.5 }
+    }
+  ],
+  "supported-platforms" : { "squares" : "shared" }
+}
