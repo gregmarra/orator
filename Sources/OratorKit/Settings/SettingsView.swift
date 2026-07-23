@@ -6,12 +6,20 @@ import Carbon.HIToolbox
 /// No per-app profiles / workflow editor / model picker / plugins (ORA-CFG-004).
 public struct SettingsView: View {
     @State private var hotkey: HotkeyChord = Settings.shared.hotkey
-    @State private var micPolicy: MicPolicy = Settings.shared.micPolicy
+    @State private var micSelection: MicSelection = Settings.shared.micSelection
+    /// Live list of input devices; refreshes as mics are plugged/unplugged while Settings is open.
+    @State private var deviceList = AudioDeviceList()
+    /// Live input-level meter for the selected device (Settings-only; released on disappear).
+    @State private var meter = MicLevelMonitor()
     @State private var launchAtLogin: Bool = LaunchAtLogin.isEnabled
     @State private var soundEnabled: Bool = Settings.shared.soundEnabled
     @State private var vocabulary: [String] = Settings.shared.vocabulary
     @State private var newTerm: String = ""
     @State private var recordingHotkey = false
+    /// Whether this window is the active/key window. The meter holds the microphone (orange indicator,
+    /// battery, and a second session on the same device a recording might use), so we only run it while
+    /// Settings is the frontmost window and pause it otherwise (ORA-CAP-010).
+    @Environment(\.controlActiveState) private var controlActiveState
     @Bindable private var language: LanguageModel
     /// A not-yet-installed language the user picked, awaiting download confirmation.
     @State private var pendingInstallID: String?
@@ -45,11 +53,7 @@ public struct SettingsView: View {
                     .onChange(of: recordingHotkey) { _, active in onHotkeyRecording?(active) }
                 }
                 languageRow
-                Picker("Microphone", selection: $micPolicy) {
-                    Text("System default").tag(MicPolicy.followDefault)
-                    Text("Built-in microphone").tag(MicPolicy.builtIn)
-                }
-                .onChange(of: micPolicy) { _, v in Settings.shared.micPolicy = v }
+                micRow
                 Toggle("Play start/stop sounds", isOn: $soundEnabled)
                     .onChange(of: soundEnabled) { _, v in Settings.shared.soundEnabled = v }
                 Toggle("Launch at login", isOn: $launchAtLogin)
@@ -95,6 +99,99 @@ public struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 420, height: 540)
         .task { await language.reload?() }   // read supported/installed locales dynamically on open
+        .onAppear { deviceList.start(); syncMeter() }     // live mic list while open; meter gated on active
+        .onDisappear { deviceList.stop(); meter.stop() }
+        // Only meter while this window is frontmost — pause when the user switches away or is dictating
+        // into another app (so the mic isn't held, and we don't run a second session on it).
+        .onChange(of: controlActiveState) { _, _ in syncMeter() }
+        // Re-meter the resolved device when the system default or the set of present devices changes
+        // (e.g. a pinned mic is unplugged → readout switches to the fallback). Gate on active state so
+        // a background device change can't re-acquire the mic while the window is inactive — the
+        // meter's own no-op guard doesn't cover the stopped case (ORA-CAP-020).
+        .onChange(of: deviceList.defaultUID) { _, _ in if controlActiveState != .inactive { meter.restart() } }
+        .onChange(of: deviceList.devices) { _, _ in if controlActiveState != .inactive { meter.restart() } }
+    }
+
+    /// Run the meter only while the window is active; stop it (releasing the mic) otherwise.
+    private func syncMeter() {
+        if controlActiveState == .inactive { meter.stop() } else { meter.start() }
+    }
+
+    /// Microphone picker: "Automatic" (follow system default), a pinned "Built-in", or any specific
+    /// present device. A pinned device is sticky — selecting one stores its UID, and `AudioCapture`
+    /// falls back to the default when it's absent and re-engages it when it returns.
+    @ViewBuilder private var micRow: some View {
+        // Picker + level bar + status as ONE Form row, so no divider (horizontal rule) separates the
+        // bar from the picker it belongs to.
+        VStack(alignment: .leading, spacing: 8) {
+        Picker("Microphone", selection: $micSelection) {
+            Text("Automatic (system default)").tag(MicSelection.automatic)
+            Text("Built-in microphone").tag(MicSelection.builtIn)
+            if !deviceList.devices.isEmpty { Divider() }
+            ForEach(deviceList.devices) { d in
+                Text(rowLabel(for: d)).tag(MicSelection.device(uid: d.uid))
+            }
+            // A pinned device that isn't currently plugged in: keep a row so the selection stays
+            // visible — by its last-known name when we have one — rather than showing a blank picker.
+            if case .device(let uid) = micSelection,
+               !deviceList.devices.contains(where: { $0.uid == uid }) {
+                let name = Settings.shared.rememberedDeviceName(for: uid)
+                Text(name.map { "\($0) (unavailable)" } ?? "Selected microphone (unavailable)")
+                    .tag(MicSelection.device(uid: uid))
+            }
+        }
+        .onChange(of: micSelection) { _, v in
+            Settings.shared.micSelection = v
+            meter.restart()   // preview the newly-selected device immediately
+        }
+
+        // Level bar directly beneath the picker (same row, no rule), then a compact status line.
+        // Combine them into one VoiceOver element so the spoken value carries BOTH the live level and
+        // the resolved-device/error state (the bar alone would announce "0 percent" when silent —
+        // indistinguishable from a dead mic) (ORA-CAP-021).
+        VStack(alignment: .leading, spacing: 4) {
+            LevelBar(level: meter.level)
+            micStatus
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(micStatusText)
+        }
+    }
+
+    /// Picker row label: annotate the system default, and disambiguate identical names (two of the same
+    /// USB camera) with a short UID suffix so the user can tell them apart (ORA-CAP-011).
+    private func rowLabel(for d: CoreAudioSupport.InputDevice) -> String {
+        let collides = deviceList.devices.filter { $0.name == d.name }.count > 1
+        var label = d.name
+        if collides { label += " (\(d.uid.suffix(4)))" }
+        if d.uid == deviceList.defaultUID { label += " (default)" }
+        return label
+    }
+
+    /// Compact status under the level bar: the *effective* mode + resolved device, e.g.
+    /// "Automatic (MacBook Air Microphone)". Middle-truncates when it doesn't fit, so both the mode and
+    /// the tail of the device name stay visible. Also covers the can't-open and no-device states.
+    @ViewBuilder private var micStatus: some View {
+        Text(micStatusText)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var micStatusText: String {
+        if meter.permissionDenied { return "Microphone access is off — enable it in System Settings" }
+        if let failed = meter.openFailure { return "\(failed) unavailable — may be in use" }
+        // Prefer the picker's (Core Audio) name so the list and status agree.
+        let liveName = meter.resolvedUID.flatMap { uid in deviceList.devices.first { $0.uid == uid }?.name }
+        guard let name = liveName ?? meter.resolvedName else { return "No microphone available" }
+        switch micSelection {
+        case .automatic: return "Automatic (\(name))"
+        case .builtIn:   return "Built-in (\(name))"
+        // A present pin shows its own name; a fallen-back pin is effectively automatic.
+        case .device:    return meter.substituted ? "Automatic (\(name))" : name
+        }
     }
 
     /// Language picker built from the transcriber's supported locales (dynamic). Selecting a language
@@ -154,6 +251,38 @@ public struct SettingsView: View {
         newTerm = ""
     }
 
+}
+
+/// A slim horizontal input-level meter (0…1). Theme-aware via `.tint`/`.quaternary`; the level is
+/// smoothed upstream, so the tiny linear animation just removes sub-frame jitter.
+struct LevelBar: View {
+    var level: Float
+
+    var body: some View {
+        GeometryReader { geo in
+            let fraction = CGFloat(min(1, max(0, level)))
+            ZStack(alignment: .leading) {
+                Capsule().fill(.quaternary)
+                Capsule().fill(.tint).frame(width: max(2, geo.size.width * fraction))
+            }
+        }
+        .frame(height: 6)
+        .animation(.linear(duration: 0.05), value: level)
+        .accessibilityLabel("Input level")
+        // Coarse buckets (not a live percentage) so a ~30 Hz value doesn't spam VoiceOver; the
+        // .updatesFrequently trait tells VoiceOver to re-read on demand rather than announce churn.
+        .accessibilityValue(Self.levelWord(level))
+        .accessibilityAddTraits(.updatesFrequently)
+    }
+
+    private static func levelWord(_ level: Float) -> String {
+        switch min(1, max(0, level)) {
+        case ..<0.05: return "silent"
+        case ..<0.35: return "low"
+        case ..<0.70: return "medium"
+        default:      return "high"
+        }
+    }
 }
 
 /// A minimal hotkey recorder: click to capture the next chord.

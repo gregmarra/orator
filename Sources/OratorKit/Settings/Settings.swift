@@ -11,11 +11,37 @@ public struct HotkeyChord: Codable, Equatable, Sendable {
 }
 
 /// How Orator chooses its capture device (ORA-CAP-002).
-public enum MicPolicy: String, Codable, CaseIterable, Sendable {
+///
+/// Resolution is re-evaluated at every record start, so a pinned device is *sticky*: if it's absent
+/// we fall back to the system default, and when it reappears we use it again — no relatch needed,
+/// because the preference is stored by UID, not by a one-time device handle.
+public enum MicSelection: Codable, Equatable, Hashable, Sendable {
     /// Follow the system default input device (default; respects the user's mic choice, incl. clamshell). Recommended.
-    case followDefault
-    /// Pin the built-in microphone (avoids low-bandwidth Bluetooth HFP paths; optional).
+    case automatic
+    /// Pin the built-in microphone (avoids low-bandwidth Bluetooth HFP paths; resolved by transport type,
+    /// so it stays "the built-in" across machines rather than a frozen UID).
     case builtIn
+    /// Pin a specific device by its Core Audio UID. Sticky: falls back to `automatic` when absent.
+    case device(uid: String)
+
+    /// Compact persisted form: "automatic" | "builtIn" | "device:<uid>".
+    var storageValue: String {
+        switch self {
+        case .automatic: return "automatic"
+        case .builtIn: return "builtIn"
+        case .device(let uid): return "device:\(uid)"
+        }
+    }
+
+    init(storageValue raw: String) {
+        switch raw {
+        case "automatic", "followDefault": self = .automatic   // "followDefault" = migrated old MicPolicy
+        case "builtIn": self = .builtIn
+        default:
+            if raw.hasPrefix("device:") { self = .device(uid: String(raw.dropFirst("device:".count))) }
+            else { self = .automatic }
+        }
+    }
 }
 
 /// UserDefaults-backed settings with an explicit, defaulted schema (ORA-CFG-002).
@@ -29,7 +55,9 @@ public final class Settings {
     private let defaults: UserDefaults
     private enum Key {
         static let hotkey = "Hotkey"
-        static let micPolicy = "MicPolicy"
+        static let micPolicy = "MicPolicy"       // legacy; read-only for migration into micSelection
+        static let micSelection = "MicSelection"
+        static let deviceNames = "DeviceNames"   // uid -> last-seen display name (for offline pins)
         static let localeIdentifier = "LocaleIdentifier"
         static let vocabulary = "CustomVocabulary"
         static let soundEnabled = "SoundEnabled"
@@ -51,9 +79,26 @@ public final class Settings {
         set { defaults.set(try? JSONEncoder().encode(newValue), forKey: Key.hotkey) }
     }
 
-    public var micPolicy: MicPolicy {
-        get { MicPolicy(rawValue: defaults.string(forKey: Key.micPolicy) ?? "") ?? .followDefault }
-        set { defaults.set(newValue.rawValue, forKey: Key.micPolicy) }
+    /// Reads the legacy "MicPolicy" key too, so an existing install's `followDefault`/`builtIn` choice
+    /// carries over (ORA-CFG-002).
+    public var micSelection: MicSelection {
+        get { MicSelection(storageValue: defaults.string(forKey: Key.micSelection)
+                            ?? defaults.string(forKey: Key.micPolicy) ?? "automatic") }
+        set { defaults.set(newValue.storageValue, forKey: Key.micSelection) }
+    }
+
+    /// Last-seen display name per device UID, so a pinned device that's currently unplugged can still
+    /// be shown by name in the picker (ORA-CAP-009). Merges a whole enumeration in ONE read/write
+    /// (not one dictionary rewrite per device), and writes only if something actually changed.
+    public func rememberDeviceNames(_ names: [String: String]) {
+        var map = defaults.dictionary(forKey: Key.deviceNames) as? [String: String] ?? [:]
+        var changed = false
+        for (uid, name) in names where map[uid] != name { map[uid] = name; changed = true }
+        if changed { defaults.set(map, forKey: Key.deviceNames) }
+    }
+
+    public func rememberedDeviceName(for uid: String) -> String? {
+        (defaults.dictionary(forKey: Key.deviceNames) as? [String: String])?[uid]
     }
 
     public var localeIdentifier: String {

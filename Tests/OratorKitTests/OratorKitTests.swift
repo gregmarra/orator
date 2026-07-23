@@ -125,13 +125,35 @@ final class OratorKitTests: XCTestCase {
     func testSettingsDefaultsAndPersistence() {
         let suite = UserDefaults(suiteName: "OratorTests-\(UUID().uuidString)")!
         let settings = Settings(defaults: suite)
-        XCTAssertEqual(settings.micPolicy, .followDefault)    // ORA-CAP-002 default
+        XCTAssertEqual(settings.micSelection, .automatic)     // ORA-CAP-002 default
         XCTAssertEqual(settings.localeIdentifier, "en-US")    // English v1
         XCTAssertTrue(settings.soundEnabled)
         XCTAssertEqual(settings.hotkey, .defaultChord)        // ⌥Space
 
         settings.vocabulary = ["Acme", "Orator"]
         XCTAssertEqual(Settings(defaults: suite).vocabulary, ["Acme", "Orator"])
+    }
+
+    // Mic selection persists by UID (so a pinned device is sticky across launches) and migrates the
+    // legacy "MicPolicy" key. Round-trips through the compact storage form.
+    @MainActor
+    func testMicSelectionPersistenceAndMigration() {
+        // Storage form round-trips all three cases.
+        for sel: MicSelection in [.automatic, .builtIn, .device(uid: "ABC-USB-Cam:1")] {
+            XCTAssertEqual(MicSelection(storageValue: sel.storageValue), sel)
+        }
+        // A pinned device persists by UID.
+        let suite = UserDefaults(suiteName: "OratorTests-\(UUID().uuidString)")!
+        let settings = Settings(defaults: suite)
+        settings.micSelection = .device(uid: "ABC-USB-Cam:1")
+        XCTAssertEqual(Settings(defaults: suite).micSelection, .device(uid: "ABC-USB-Cam:1"))
+
+        // Legacy MicPolicy values migrate: followDefault → automatic, builtIn → builtIn.
+        let legacy = UserDefaults(suiteName: "OratorTests-\(UUID().uuidString)")!
+        legacy.set("followDefault", forKey: "MicPolicy")
+        XCTAssertEqual(Settings(defaults: legacy).micSelection, .automatic)
+        legacy.set("builtIn", forKey: "MicPolicy")
+        XCTAssertEqual(Settings(defaults: legacy).micSelection, .builtIn)
     }
 
     // ORA-IND-012: panel size is a pure function of notch/pill — independent of preview text length.
@@ -198,12 +220,84 @@ final class OratorKitTests: XCTestCase {
     @MainActor
     func testBuiltInMicResolvesToBuiltInTransport() throws {
         try XCTSkipUnless(CoreAudioSupport.builtInInputUID() != nil, "no built-in input on this host")
-        let resolved = AudioCapture.builtInMicrophone()
         let builtInUID = CoreAudioSupport.builtInInputUID()
-        XCTAssertNotNil(resolved, "built-in resolver returned nil despite a built-in device existing")
-        // It must be THE built-in (UID match), not the first arbitrary mic.
-        XCTAssertEqual(resolved?.uniqueID, builtInUID,
-                       "resolved '\(resolved?.localizedName ?? "nil")' is not the built-in device")
+        // Built-in mode must resolve to THE built-in (transport-matched UID), not the first arbitrary mic.
+        let resolved = AudioCapture.resolveUID(.builtIn, using: .live)
+        XCTAssertEqual(resolved.uid, builtInUID,
+                       "built-in resolution did not land on the built-in device")
+        // The memoized O(1) built-in lookup must agree with the authoritative enumeration.
+        XCTAssertEqual(AudioCapture.cachedBuiltInInputUID(), builtInUID)
+    }
+
+    // The garbage-input fix (ORA-CAP-006): the automatic/built-in fallback must NEVER hand back a
+    // device that isn't a usable, channel-bearing input — otherwise a webcam that advertises silent
+    // audio produces a dead-mic recording. bestUsableInput() is the terminal fallback for every path.
+    @MainActor
+    func testBestUsableInputIsAlwaysUsable() throws {
+        try XCTSkipUnless(!CoreAudioSupport.inputDeviceList().isEmpty, "no inputs on this host")
+        let dev = try XCTUnwrap(AudioCapture.bestUsableInput(), "expected some usable input to exist")
+        XCTAssertTrue(CoreAudioSupport.isUsableInput(uid: dev.uniqueID),
+                      "bestUsableInput returned a non-usable (garbage) device: \(dev.localizedName)")
+    }
+
+    // ORA-CAP-009: a device's last-seen name is remembered by UID so an unplugged pinned device can
+    // still be shown by name.
+    @MainActor
+    func testDeviceNameMemoryRoundTrips() {
+        let suite = UserDefaults(suiteName: "OratorTests-\(UUID().uuidString)")!
+        let s = Settings(defaults: suite)
+        XCTAssertNil(s.rememberedDeviceName(for: "USB-Cam:1"))
+        s.rememberDeviceNames(["USB-Cam:1": "Work USB Camera", "Built-in": "MacBook Air Microphone"])
+        XCTAssertEqual(Settings(defaults: suite).rememberedDeviceName(for: "USB-Cam:1"), "Work USB Camera")
+        XCTAssertEqual(Settings(defaults: suite).rememberedDeviceName(for: "Built-in"), "MacBook Air Microphone")
+    }
+
+    // ORA-CAP-012: the pure selection decision, exercised headlessly with a fake DeviceProvider —
+    // every fallback/substitution branch without touching hardware.
+    @MainActor
+    func testResolveUIDDecisionTable() {
+        func provider(_ def: String?, _ builtIn: String?, usable: Set<String>, ordered: [String])
+            -> AudioCapture.DeviceProvider {
+            AudioCapture.DeviceProvider(
+                defaultInputUID: { def }, builtInUID: { builtIn },
+                isUsable: { usable.contains($0) }, orderedInputUIDs: { ordered })
+        }
+
+        // automatic + usable default → as-selected, not substituted
+        var r = AudioCapture.resolveUID(.automatic, using: provider("D", "B", usable: ["D", "B"], ordered: ["D", "B"]))
+        XCTAssertEqual(r.uid, "D"); XCTAssertFalse(r.substituted)
+
+        // automatic + garbage default → best usable (built-in), substituted
+        r = AudioCapture.resolveUID(.automatic, using: provider("D", "B", usable: ["B"], ordered: ["D", "B"]))
+        XCTAssertEqual(r.uid, "B"); XCTAssertTrue(r.substituted)
+
+        // builtIn + no built-in present → best usable other, substituted
+        r = AudioCapture.resolveUID(.builtIn, using: provider("X", nil, usable: ["X"], ordered: ["X"]))
+        XCTAssertEqual(r.uid, "X"); XCTAssertTrue(r.substituted)
+
+        // pinned present → as-selected, not substituted
+        r = AudioCapture.resolveUID(.device(uid: "P"), using: provider("D", "B", usable: ["P", "D"], ordered: ["P", "D"]))
+        XCTAssertEqual(r.uid, "P"); XCTAssertFalse(r.substituted)
+
+        // pinned absent, default usable → default, substituted
+        r = AudioCapture.resolveUID(.device(uid: "P"), using: provider("D", "B", usable: ["D", "B"], ordered: ["D", "B"]))
+        XCTAssertEqual(r.uid, "D"); XCTAssertTrue(r.substituted)
+
+        // pinned absent AND default garbage → best usable, substituted
+        r = AudioCapture.resolveUID(.device(uid: "P"), using: provider("D", "B", usable: ["B"], ordered: ["D", "B"]))
+        XCTAssertEqual(r.uid, "B"); XCTAssertTrue(r.substituted)
+
+        // nothing usable → nil uid (caller throws noInputDevice rather than capturing a dead device)
+        r = AudioCapture.resolveUID(.automatic, using: provider("D", "B", usable: [], ordered: ["D", "B"]))
+        XCTAssertNil(r.uid)
+    }
+
+    // ORA-CAP-015: distinct, legible failure copy for the real recording surface.
+    func testCaptureErrorMessagesAreDistinct() {
+        XCTAssertEqual(AudioCapture.CaptureError.noInputDevice.errorDescription, "No microphone is connected.")
+        let opened = AudioCapture.CaptureError.sessionStartFailed("raw").errorDescription
+        XCTAssertNotNil(opened)
+        XCTAssertNotEqual(opened, AudioCapture.CaptureError.noInputDevice.errorDescription)
     }
 
     // Headless END-TO-END: synthesize a known utterance with `say`, replay it through the real

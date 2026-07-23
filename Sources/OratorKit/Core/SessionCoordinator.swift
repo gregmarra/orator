@@ -38,7 +38,10 @@ public final class SessionCoordinator: SpeechResultSink {
 
     // Session bookkeeping.
     private var target: TargetContext?
-    private var startDate: Date?
+    /// Monotonic recording start instant — drives `elapsed` and the max-duration auto-stop. Monotonic
+    /// (not wall-clock Date) so an NTP/DST/manual clock jump can't skew the timer or mis-fire the
+    /// auto-stop (ORA-SM-013).
+    private var startInstant: ContinuousClock.Instant?
     private var lastToggle: Date?
     /// Set synchronously in `toggle()` before the async start, so a second press during start-up
     /// cannot re-enter `startRecording` (closes the reentrancy window; ORA-SM-001/003).
@@ -68,7 +71,10 @@ public final class SessionCoordinator: SpeechResultSink {
 
     /// Abort an in-progress dictation, preserving already-confirmed text in recovery (never lost).
     private func abortSession(reason: String) {
-        guard state == .recording || state == .finalizing else { return }
+        // Only an ACTIVE recording is abortable. During `.finalizing` capture is already stopped, so a
+        // late/stale mic-loss callback must NOT run — it would divert the just-transcribed text to
+        // recovery instead of inserting it (ORA-CAP-022).
+        guard state == .recording else { return }
         Log.session.error("Session aborted: \(reason)")
         teardownCapture()
         engine.endSession()
@@ -153,6 +159,16 @@ public final class SessionCoordinator: SpeechResultSink {
             feedback.playError()
             return
         }
+        // TCC mic access can be revoked after launch; capturing without it doesn't throw — it just
+        // delivers silence. Re-check O(1) so a denied mic surfaces as a permission problem rather than
+        // a silent dead-air recording (ORA-CAP-018).
+        guard permissions.microphoneGranted else {
+            Log.session.error("Cannot start: microphone permission not granted")
+            readiness = .needsPermission(permissions.missing())
+            lastError = "Microphone access is off. Enable it in System Settings."
+            feedback.playError()
+            return
+        }
 
         target = TargetContext.capture()
         confirmedText = ""
@@ -176,11 +192,17 @@ public final class SessionCoordinator: SpeechResultSink {
 
         // Enter recording ONLY after capture actually started (ORA-SM-004).
         state = .recording
-        startDate = Date()
+        startInstant = ContinuousClock.now
         lastError = nil
         DebugLog.stage("start→capturing", ms: (ContinuousClock.now - began).milliseconds)   // M1 (ORA-PERF-004)
         feedback.playStart()                                      // non-blocking cue (overlapped)
         await engine.beginSession(vocabulary: Settings.shared.vocabulary)  // set vocab before feeding
+
+        // `beginSession` is a suspension point: a second hotkey press during it runs stopAndInsert →
+        // teardownCapture concurrently. If we resumed here on a torn-down session we'd wire an orphan
+        // bridge/tick that feeds audio into the engine AFTER endSession (duplicate/garbled text) and
+        // ticks past teardown. Bail if the session is no longer recording (ORA-SM-014).
+        guard state == .recording else { return }
 
         // Bridge audio → engine (the audio consumer). Detached so buffers never hop the main actor
         // (the engine's `feed` is nonisolated). The engine's own single results task (ORA-CC-003)
@@ -206,7 +228,7 @@ public final class SessionCoordinator: SpeechResultSink {
         state = .finalizing
         // Snapshot the volatile tail before teardown/finalize: fallback if a clean finalize yields no confirmed text.
         let tailAtStop = volatilePreview
-        teardownCapture()
+        await teardownCaptureDraining()   // graceful stop: DRAIN trailing buffers (don't drop them)
 
         let finished = await engine.finalize(within: finalizationCap)
         DebugLog.stage("stop→final", ms: (ContinuousClock.now - stopped).milliseconds)   // M3
@@ -226,7 +248,7 @@ public final class SessionCoordinator: SpeechResultSink {
         await insert(finalText, tail: unfinalizedTail)
         DebugLog.stage("stop→inserted", ms: (ContinuousClock.now - stopped).milliseconds)   // M2
         state = .idle
-        startDate = nil
+        startInstant = nil
     }
 
     private func insert(_ text: String, tail: String) async {
@@ -260,8 +282,8 @@ public final class SessionCoordinator: SpeechResultSink {
         tickTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(100))
-                guard let self, let start = self.startDate else { break }
-                self.elapsed = Date().timeIntervalSince(start)
+                guard let self, let start = self.startInstant else { break }
+                self.elapsed = (ContinuousClock.now - start).milliseconds / 1000   // monotonic seconds
                 self.audioLevel = self.audio.currentLevel
                 if self.elapsed >= self.maxDuration {
                     await self.stopAndInsert()        // auto-stop as a normal stop (E14)
@@ -271,9 +293,28 @@ public final class SessionCoordinator: SpeechResultSink {
         }
     }
 
+    /// Discard-path teardown (cancel/abort): drop the bridge — its unconsumed buffers are intentionally
+    /// thrown away.
     private func teardownCapture() {
         audio.stop()
         bridgeTask?.cancel(); bridgeTask = nil
+        stopTimersAndTaps()
+    }
+
+    /// Graceful-stop teardown: finish the stream, then DRAIN the bridge so audio captured just before
+    /// key-release is fed to the engine before `finalize()`. Cancelling (as the discard path does)
+    /// would short-circuit the consumer and drop those trailing buffers — the audio would never be
+    /// transcribed (ORA-CAP-023). Bounded by the current bridge backlog (the tail after finish()).
+    private func teardownCaptureDraining() async {
+        audio.stop()                // continuation.finish() → the bridge loop ends once drained
+        await bridgeTask?.value      // consume all buffered inputs into engine.feed() first
+        bridgeTask = nil
+        stopTimersAndTaps()
+    }
+
+    /// The teardown shared by both stop paths: the UI tick and the Escape tap (only bridge handling
+    /// differs — cancel vs drain).
+    private func stopTimersAndTaps() {
         tickTask?.cancel(); tickTask = nil
         escapeTap?.stop(); escapeTap = nil
     }
