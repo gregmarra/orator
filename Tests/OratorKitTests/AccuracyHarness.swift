@@ -164,10 +164,10 @@ final class AccuracyHarnessTests: XCTestCase {
             if buf.frameLength == 0 { break }
             let cap = AVAudioFrameCount(Double(buf.frameLength) * (target.sampleRate / inFmt.sampleRate)) + 1024
             guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: cap) else { break }
-            var done = false
+            let once = ConsumeOnce()
             let st = conv.convert(to: out, error: nil) { _, s in
-                if done { s.pointee = .noDataNow; return nil }
-                done = true; s.pointee = .haveData; return buf
+                if once.done { s.pointee = .noDataNow; return nil }
+                once.done = true; s.pointee = .haveData; return buf
             }
             if st != .error, out.frameLength > 0 { engine.feed(AnalyzerInput(buffer: out), for: token) }
             // Pace at wall-clock, like a microphone. Fed flat out the analyzer returns NOTHING —
@@ -220,6 +220,11 @@ final class AccuracyHarnessTests: XCTestCase {
         }
     }
 }
+
+/// One-shot flag for the converter's input block. A reference box rather than a captured `var`: the
+/// block is `@Sendable`, so mutating a local from inside it is a data-race warning in Swift 6. Mirrors
+/// the box `PCMConverter` uses on the real path.
+private final class ConsumeOnce: @unchecked Sendable { var done = false }
 
 /// Writes captured buffers to a file in their delivered format, tracking peak for a clipping check.
 private final class FileWriter: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
