@@ -61,7 +61,11 @@ public struct SettingsView: View {
             }
 
             Section {
-                Button("Reset Setup and Permissions…", role: .destructive) { onReset?() }
+                // Opens the guided setup window. NOT destructive and not a reset: the actual
+                // (destructive) permission resets are per-step buttons inside that window. Labelling
+                // this "Reset Setup and Permissions…" in red promised an irreversible revoke it never
+                // performed, and simultaneously hid setup behind a button nobody wanting setup would press.
+                Button("Open Setup…") { onReset?() }
             }
 
             // Vocabulary last: it grows as the user adds terms, so it never pushes the fixed controls;
@@ -158,14 +162,9 @@ public struct SettingsView: View {
         }
     }
 
-    /// Picker row label: annotate the system default, and disambiguate identical names (two of the same
-    /// USB camera) with a short UID suffix so the user can tell them apart (ORA-CAP-011).
+    /// Picker row label — the decision itself lives in `MicStatus` so it is unit-testable.
     private func rowLabel(for d: CoreAudioSupport.InputDevice) -> String {
-        let collides = deviceList.devices.filter { $0.name == d.name }.count > 1
-        var label = d.name
-        if collides { label += " (\(d.uid.suffix(4)))" }
-        if d.uid == deviceList.defaultUID { label += " (default)" }
-        return label
+        MicStatus.rowLabel(for: d, among: deviceList.devices, defaultUID: deviceList.defaultUID)
     }
 
     /// Compact status under the level bar: the *effective* mode + resolved device, e.g.
@@ -180,18 +179,17 @@ public struct SettingsView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    /// Status line — the decision itself lives in `MicStatus` so it is unit-testable.
     private var micStatusText: String {
-        if meter.permissionDenied { return "Microphone access is off — enable it in System Settings" }
-        if let failed = meter.openFailure { return "\(failed) unavailable — may be in use" }
         // Prefer the picker's (Core Audio) name so the list and status agree.
         let liveName = meter.resolvedUID.flatMap { uid in deviceList.devices.first { $0.uid == uid }?.name }
-        guard let name = liveName ?? meter.resolvedName else { return "No microphone available" }
-        switch micSelection {
-        case .automatic: return "Automatic (\(name))"
-        case .builtIn:   return "Built-in (\(name))"
-        // A present pin shows its own name; a fallen-back pin is effectively automatic.
-        case .device:    return meter.substituted ? "Automatic (\(name))" : name
-        }
+        return MicStatus.text(permissionDenied: meter.permissionDenied,
+                              openFailure: meter.openFailure,
+                              liveName: liveName,
+                              resolvedName: meter.resolvedName,
+                              selection: micSelection,
+                              substituted: meter.substituted,
+                              clipping: meter.clipping)
     }
 
     /// Language picker built from the transcriber's supported locales (dynamic). Selecting a language
