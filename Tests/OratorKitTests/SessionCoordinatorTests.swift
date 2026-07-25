@@ -82,11 +82,12 @@ private final class FakePermissions: PermissionsManager {
 /// Silences the suite and records which cues fired — the terminal-feedback contract is the behaviour
 /// under test, not a side effect.
 private final class SpyFeedback: SoundFeedback, @unchecked Sendable {
-    enum Cue: Equatable { case start, stop, error }
+    enum Cue: Equatable { case start, stop, error, nothingHeard }
     private(set) var cues: [Cue] = []
     override func playStart() { cues.append(.start) }
     override func playStop() { cues.append(.stop) }
     override func playError() { cues.append(.error) }
+    override func playNothingHeard() { cues.append(.nothingHeard) }
 }
 
 // MARK: - Tests
@@ -356,6 +357,9 @@ final class SessionCoordinatorTests: XCTestCase {
 
         XCTAssertTrue(rig.inserter.insertedTexts.isEmpty)
         XCTAssertFalse(rig.feedback.cues.contains(.stop))
+        // A benign empty result gets the soft falling tone, NOT the alarming error sound.
+        XCTAssertTrue(rig.feedback.cues.contains(.nothingHeard))
+        XCTAssertFalse(rig.feedback.cues.contains(.error))
         XCTAssertEqual(rig.coordinator.notice, "Didn’t catch anything")
     }
 

@@ -534,7 +534,9 @@ public final class SessionCoordinator: SpeechResultSink {
     /// fact — exactly when a user reports "transcription isn't working".
     private func emptyResultFeedback(_ lossReason: String? = nil) {
         Log.session.notice("Dictation produced no text (elapsed \(self.elapsed, format: .fixed(precision: 1))s, peak level \(self.peakLevel, format: .fixed(precision: 3)))")
-        feedback.playError()
+        // A soft falling tone, not the error sound: hearing nothing is a benign outcome, not a fault.
+        // Capture DYING is a fault and keeps `playError`.
+        if lossReason == nil { feedback.playNothingHeard() } else { feedback.playError() }
         showNotice(lossReason ?? "Didn’t catch anything")
     }
 
