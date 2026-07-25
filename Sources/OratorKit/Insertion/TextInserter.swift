@@ -65,28 +65,33 @@ public final class TextInserter {
             return .deferredToRecovery(.secureField)          // ORA-INS-007 / E9
         }
 
-        // 3. Paste path with full pasteboard discipline (ORA-INS-005). Prepend a separating space when
-        //    the caret sits immediately after a word character, so back-to-back dictations into the
-        //    same field don't run together (ORA-INS-008).
+        // 3. Paste path with full pasteboard discipline (ORA-INS-005). The text already in the field
+        //    decides two things: whether we need a separating space (ORA-INS-008), and whether this
+        //    dictation starts a sentence. Both come from one read of the caret context — capitalizing
+        //    unconditionally upstream is what made a continuation after "hello," come back as "Hello".
         let delay = target.bundleID.flatMap { Self.settleDelays[$0] }
-        let toInsert = needsLeadingSpace(element) ? " " + text : text
+        let preceding = precedingText(element)
+        var toInsert = SentenceContext.startsSentence(after: preceding)
+            ? TranscriptCleaner.capitalized(text) : text
+        if SentenceContext.needsLeadingSpace(after: preceding) { toInsert = " " + toInsert }
         return await paste(toInsert, settle: delay, element: element)
     }
 
-    /// Best-effort: true when the caret sits right after a non-whitespace character (so a new
-    /// dictation needs a separating space). Reads value + caret offset via AX; false when either
-    /// isn't readable — the safe default for fields that don't expose these attributes.
-    private func needsLeadingSpace(_ element: AXUIElement) -> Bool {
-        guard let text = copyString(element, kAXValueAttribute), !text.isEmpty else { return false }
+    /// The field's text up to the caret, or nil when it isn't readable via AX — the safe default for
+    /// fields that don't expose these attributes, which callers treat as "standalone text".
+    private func precedingText(_ element: AXUIElement) -> String? {
+        guard let text = copyString(element, kAXValueAttribute) else { return nil }
+        guard !text.isEmpty else { return "" }
         var rangeRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
-              let axRange = rangeRef, CFGetTypeID(axRange) == AXValueGetTypeID() else { return false }
+              let axRange = rangeRef, CFGetTypeID(axRange) == AXValueGetTypeID() else { return nil }
         var caret = CFRange()
-        guard AXValueGetValue((axRange as! AXValue), .cfRange, &caret), caret.location > 0 else { return false }
+        guard AXValueGetValue((axRange as! AXValue), .cfRange, &caret), caret.location >= 0 else { return nil }
+        // AX offsets are UTF-16; clamp because a stale caret can outrun the value we just read.
         let units = Array(text.utf16)
-        let i = caret.location - 1   // guarded by caret.location > 0 above, so i >= 0
-        guard i < units.count, let scalar = Unicode.Scalar(units[i]) else { return false }
-        return !CharacterSet.whitespacesAndNewlines.contains(scalar)
+        let end = min(caret.location, units.count)
+        guard end >= 0 else { return nil }
+        return String(decoding: units[0..<end], as: UTF16.self)
     }
 
     // MARK: Focused-field inspection

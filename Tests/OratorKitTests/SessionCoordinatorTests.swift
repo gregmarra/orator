@@ -277,7 +277,7 @@ final class SessionCoordinatorTests: XCTestCase {
         await waitUntilIdle(rig.coordinator)
 
         XCTAssertEqual(rig.coordinator.state, .idle)
-        XCTAssertEqual(rig.inserter.insertedTexts, ["Hello world"],
+        XCTAssertEqual(rig.inserter.insertedTexts, ["hello world"],
                        "text must be offered to the focused target, not parked in the menu")
         XCTAssertEqual(rig.recovery.entries.first?.reason, .inserted,
                        "a placed result is filed as inserted, NOT as .noTarget")
@@ -295,9 +295,13 @@ final class SessionCoordinatorTests: XCTestCase {
         rig.coordinator.toggle()                       // stop → finalize → insert
         await waitUntilIdle(rig.coordinator)
 
-        XCTAssertEqual(rig.inserter.insertedTexts, ["Hello world"])
+        // The coordinator hands over text WITHOUT a forced capital: whether it starts a sentence
+        // depends on what precedes the caret, which only `TextInserter` can see (SentenceContext).
+        XCTAssertEqual(rig.inserter.insertedTexts, ["hello world"])
         XCTAssertEqual(rig.feedback.cues, [.start, .stop])
         XCTAssertEqual(rig.recovery.entries.first?.reason, .inserted)
+        // Recovery text stands alone, so it IS capitalized.
+        XCTAssertEqual(rig.recovery.entries.first?.text, "Hello world")
         XCTAssertNil(rig.coordinator.notice, "a clean insert needs no explanation")
     }
 
@@ -333,7 +337,7 @@ final class SessionCoordinatorTests: XCTestCase {
         await waitUntilIdle(rig.coordinator)
 
         XCTAssertEqual(rig.coordinator.state, .idle)
-        XCTAssertEqual(rig.inserter.insertedTexts, ["Hello world"], "the inserter must actually be consulted")
+        XCTAssertEqual(rig.inserter.insertedTexts, ["hello world"], "the inserter must actually be consulted")
         XCTAssertFalse(rig.feedback.cues.contains(.stop),
                        "the completion cue must mean INSERTED and nothing else")
         XCTAssertTrue(rig.feedback.cues.contains(.error))

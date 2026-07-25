@@ -462,7 +462,7 @@ public final class SessionCoordinator: SpeechResultSink {
         guard let target else {
             // No target at all — the one case where text genuinely cannot be placed (M4).
             if !text.isEmpty {
-                recovery.add(text, reason: timedOut ? .finalizationTimeout : .noTarget)
+                recovery.add(Self.standalone(text), reason: timedOut ? .finalizationTimeout : .noTarget)
                 deferredFeedback(timedOut ? .finalizationTimeout : .noTarget)
             } else {
                 emptyResultFeedback(lossReason)
@@ -476,14 +476,14 @@ public final class SessionCoordinator: SpeechResultSink {
         switch outcome {
         case .inserted:
             feedback.playStop()                      // the completion cue means INSERTED, nothing else
-            recovery.add(text, reason: .inserted)    // keep briefly so a stray paste is recoverable
+            recovery.add(Self.standalone(text), reason: .inserted)   // keep briefly so a stray paste is recoverable
             // The text landed, but the mic still died — say so, and KEEP the error: clearing it here
             // would erase the record of a hardware problem the user still has, just because this
             // dictation happened to survive it.
             if let lossReason { showNotice(lossReason) }
             else { clearError() }                    // a clean dictation clears any prior failure
         case .deferredToRecovery(let reason):
-            recovery.add(text, reason: reason)       // no text lost (M4)
+            recovery.add(Self.standalone(text), reason: reason)      // no text lost (M4)
             Log.insert.notice("Routed to recovery: \(String(describing: reason))")
             deferredFeedback(reason)
         }
@@ -504,6 +504,10 @@ public final class SessionCoordinator: SpeechResultSink {
         // confirmed nothing at all.
         return confirmed.isEmpty ? tail : confirmed
     }
+
+    /// Text bound for the recovery menu stands alone — there is no surrounding sentence for it to
+    /// continue — so it always gets a capital, unlike text pasted into a field (see `SentenceContext`).
+    private static func standalone(_ text: String) -> String { TranscriptCleaner.capitalized(text) }
 
     /// Join confirmed text with a trailing volatile fragment, inserting a separating space only when
     /// the boundary needs one — matching how `speechDidConfirm` accumulates.

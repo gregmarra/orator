@@ -339,19 +339,28 @@ final class OratorKitTests: XCTestCase {
                       "transcript did not contain expected words: '\(text)'")
     }
 
-    // ORA-ASR-007: the recognizer emits stray leading punctuation for the opening pause and drops
-    // sentence-start casing. Cases below are verbatim from live dictation traces.
-    func testTranscriptCleanerStripsLeadingJunkAndCapitalizes() {
+    // ORA-ASR-007: the recognizer emits stray leading punctuation for the opening pause. Cases below
+    // are verbatim from live dictation traces. `clean` no longer changes case — capitalization now
+    // depends on the target field's contents (see SentenceContextTests).
+    func testTranscriptCleanerStripsLeadingJunk() {
         XCTAssertEqual(TranscriptCleaner.clean(".. the waveform actually feels responsive."),
-                       "The waveform actually feels responsive.")
+                       "the waveform actually feels responsive.")
         XCTAssertEqual(TranscriptCleaner.clean(", you... there are still some of these"),
-                       "You... there are still some of these")
+                       "you... there are still some of these")
         XCTAssertEqual(TranscriptCleaner.clean(",... the speed is feeling pretty good"),
-                       "The speed is feeling pretty good")
-        XCTAssertEqual(TranscriptCleaner.clean("…  hello world"), "Hello world")
+                       "the speed is feeling pretty good")
+        XCTAssertEqual(TranscriptCleaner.clean("…  hello world"), "hello world")
         // Already-clean text is untouched (idempotent), and internal punctuation is preserved.
         XCTAssertEqual(TranscriptCleaner.clean("Testing the waveform."), "Testing the waveform.")
         XCTAssertEqual(TranscriptCleaner.clean(""), "")
+    }
+
+    // Capitalization applied at a sentence start reproduces the old end-to-end behaviour.
+    func testCleanThenCapitalizeMatchesSentenceStartOutput() {
+        XCTAssertEqual(TranscriptCleaner.capitalized(TranscriptCleaner.clean(".. the waveform actually feels responsive.")),
+                       "The waveform actually feels responsive.")
+        XCTAssertEqual(TranscriptCleaner.capitalized(TranscriptCleaner.clean("…  hello world")), "Hello world")
+        XCTAssertEqual(TranscriptCleaner.capitalized(""), "")
     }
 }
 
