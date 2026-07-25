@@ -56,15 +56,29 @@ final class OratorKitTests: XCTestCase {
         XCTAssertEqual(buffer.entries.map(\.text), ["newer"])
     }
 
+    /// A private pasteboard for every test in this file. Writing fixtures to `NSPasteboard.general`
+    /// clobbers the developer's real clipboard AND leaves a stale value that a later dictation's
+    /// deferred restore can paste into their document — observed happening.
+    @MainActor
+    private func withPrivatePasteboard(_ body: (NSPasteboard) -> Void) {
+        let pb = NSPasteboard(name: .init("OratorTests-\(UUID().uuidString)"))
+        let previous = Pasteboard.board
+        Pasteboard.board = pb
+        defer { Pasteboard.board = previous; pb.releaseGlobally() }
+        body(pb)
+    }
+
     // ORA-INS-005 / B4: the concealed + string markers live on the SAME pasteboard item.
     @MainActor
     func testConcealedMarkerOnStringItem() {
+        withPrivatePasteboard { pb in
         Pasteboard.writeConcealed("secret")
-        let items = NSPasteboard.general.pasteboardItems ?? []
+        let items = pb.pasteboardItems ?? []
         XCTAssertEqual(items.count, 1, "one item carries all types")
         let types = Set(items.first?.types.map(\.rawValue) ?? [])
         XCTAssertTrue(types.contains("public.utf8-plain-text"))
         XCTAssertTrue(types.contains(Pasteboard.concealedType.rawValue))
+        }
     }
 
     // ORA-IND-001: glyph derivation across state × readiness.
@@ -94,7 +108,7 @@ final class OratorKitTests: XCTestCase {
     // ORA-INS-005 / E13: restore must NOT clobber a newer clipboard.
     @MainActor
     func testPasteboardChangeCountGuard() {
-        let pb = NSPasteboard.general
+        withPrivatePasteboard { pb in
         pb.clearContents(); pb.setString("original", forType: .string)
         let snapshot = Pasteboard.snapshot()
         let ourCount = Pasteboard.writeConcealed("dictated")
@@ -106,18 +120,20 @@ final class OratorKitTests: XCTestCase {
         let restored = Pasteboard.restore(snapshot, ifUnchangedFrom: ourCount)
         XCTAssertFalse(restored, "must not clobber a newer clipboard")
         XCTAssertEqual(pb.string(forType: .string), "user copied this")
+        }
     }
 
     // ORA-INS-005 happy path: restore when unchanged.
     @MainActor
     func testPasteboardRestoreWhenUnchanged() {
-        let pb = NSPasteboard.general
+        withPrivatePasteboard { pb in
         pb.clearContents(); pb.setString("original", forType: .string)
         let snapshot = Pasteboard.snapshot()
         let ourCount = Pasteboard.writeConcealed("dictated")
         let restored = Pasteboard.restore(snapshot, ifUnchangedFrom: ourCount)
         XCTAssertTrue(restored)
         XCTAssertEqual(pb.string(forType: .string), "original")
+        }
     }
 
     // ORA-CFG-002: settings defaults + round-trip via an isolated suite.

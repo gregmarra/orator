@@ -72,35 +72,10 @@ public final class TextInserter {
         let delay = target.bundleID.flatMap { Self.settleDelays[$0] }
         let preceding = precedingText(element)
         let startsSentence = SentenceContext.startsSentence(after: preceding)
-        // Diagnostic for "why was this capitalized?". Logs only the CLASS of the deciding character,
-        // never the text itself — dictated content must never reach the unified log (ORA-PRIV-002).
-        Log.insert.notice("""
-            Caret context: readable=\(preceding != nil, privacy: .public) \
-            lastChar=\(SentenceContext.describeLastCharacter(of: preceding), privacy: .public) \
-            startsSentence=\(startsSentence, privacy: .public) \
-            app=\(target.bundleID ?? "unknown", privacy: .public) \
-            \(self.describeAXCapabilities(element), privacy: .public)
-            """)
         var toInsert = startsSentence ? TranscriptCleaner.capitalized(text)
                                       : TranscriptCleaner.continuing(text)
         if SentenceContext.needsLeadingSpace(after: preceding) { toInsert = " " + toInsert }
         return await paste(toInsert, settle: delay, element: element)
-    }
-
-    /// Which text-bearing attributes the focused element actually exposes. Terminals and web views
-    /// vary wildly here, and "we cannot read the caret context" has several distinct causes that need
-    /// different fallbacks — this says which one we hit. Names and shapes only, never content.
-    private func describeAXCapabilities(_ element: AXUIElement) -> String {
-        func has(_ attr: String) -> Bool {
-            var value: CFTypeRef?
-            return AXUIElementCopyAttributeValue(element, attr as CFString, &value) == .success
-        }
-        let role = copyString(element, kAXRoleAttribute) ?? "?"
-        let valueLength = copyString(element, kAXValueAttribute)?.count
-        let caret = caretLocation(element)
-        let viaRange = caret.flatMap { $0 > 0 ? stringForRange(element, location: max(0, $0 - 8), length: min(8, $0)) : "" }
-        return "role=\(role) hasValue=\(valueLength != nil) hasRange=\(has(kAXSelectedTextRangeAttribute)) "
-             + "caret=\(caret.map(String.init) ?? "-") stringForRange=\(viaRange != nil ? "ok" : "unsupported")"
     }
 
     /// How much text before the caret we ask for. We only need the last non-whitespace character, but
