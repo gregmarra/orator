@@ -120,37 +120,48 @@ public final class TextInserter {
     // MARK: Paste
 
     private func paste(_ text: String, settle: Duration?, element: AXUIElement) async -> InsertionOutcome {
-        let preLength = valueLength(of: element)      // for best-effort verification
+        let preValue = copyString(element, kAXValueAttribute)   // for best-effort verification
         let snapshot = Pasteboard.snapshot()
         let ourChangeCount = Pasteboard.writeConcealed(text)
 
         if let settle { try? await Task.sleep(for: settle) }
         postCommandV()
 
-        // Completion cue fires immediately (caller); restore must not block it (ORA-INS-005).
-        // Restore only AFTER the paste lands (focused field's value grew), or after a conservative
-        // safety delay if the value is unreadable — always guarded by changeCount so a fresh user
-        // copy is never clobbered (E13). Avoids the "restore beats a slow host that then pastes the
-        // old clipboard" wrong-text hazard.
+        // Wait for the paste to actually land (the focused field's value grew). This result was
+        // previously computed and thrown away, so a host that swallowed the synthetic ⌘V (a remapped
+        // ⌘V, a modal that stole the keystroke) still reported `.inserted`: success cue, "Inserted" in
+        // the menu, and the 5-minute TTL then deleted the only copy (E15 / SPEC §694).
+        let landed = await awaitPasteConsumed(preValue: preValue, element: element)
+
+        // Restore on its own task so it never delays the caller's completion cue (ORA-INS-005), after
+        // a conservative safety delay when the paste couldn't be confirmed — always guarded by
+        // changeCount so a fresh user copy is never clobbered (E13). Avoids the "restore beats a slow
+        // host that then pastes the old clipboard" wrong-text hazard.
         Task { @MainActor in
-            let landed = await self.awaitPasteConsumed(preLength: preLength, element: element)
             if !landed { try? await Task.sleep(for: .milliseconds(500)) }   // extra safety if unconfirmed
             Pasteboard.restore(snapshot, ifUnchangedFrom: ourChangeCount)
+        }
+
+        // Only claim rejection when the field's length was actually READABLE — an unreadable field
+        // (many browser/web-view inputs) is unverifiable, not failed, and must not raise a false alarm.
+        if preValue != nil, !landed {
+            Log.insert.notice("Paste not observed in the focused field — routing to recovery")
+            return .deferredToRecovery(.pasteRejected)
         }
         return .inserted
     }
 
-    /// Length of the element's text value, if readable via AX (nil when unavailable).
-    private func valueLength(of element: AXUIElement) -> Int? {
-        copyString(element, kAXValueAttribute)?.count
-    }
-
-    /// Poll (bounded) for the focused field's value to grow, confirming the paste landed.
-    private func awaitPasteConsumed(preLength: Int?, element: AXUIElement) async -> Bool {
-        guard let preLength else { return false }     // not verifiable ⇒ caller uses the safety delay
+    /// Poll (bounded) for the focused field's value to CHANGE, confirming the paste landed.
+    ///
+    /// Compares the whole value, not its length: ⌘V replaces the current selection, so pasting over a
+    /// selection at least as long as the new text leaves the length equal or smaller. A
+    /// length-must-grow test reports those perfectly good pastes as rejected — and re-dictating over
+    /// selected text is a normal workflow, not an edge case.
+    private func awaitPasteConsumed(preValue: String?, element: AXUIElement) async -> Bool {
+        guard let preValue else { return false }      // not verifiable ⇒ caller uses the safety delay
         let deadline = ContinuousClock.now.advanced(by: .milliseconds(800))
         while ContinuousClock.now < deadline {
-            if let now = valueLength(of: element), now > preLength { return true }
+            if let now = copyString(element, kAXValueAttribute), now != preValue { return true }
             try? await Task.sleep(for: .milliseconds(30))
         }
         return false

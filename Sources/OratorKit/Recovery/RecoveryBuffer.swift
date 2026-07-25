@@ -9,6 +9,7 @@ public enum RecoveryReason: Equatable, Sendable {
     case finalizationTimeout  // unfinalized tail parked past the cap (ORA-ASR-003 / E7)
     case noTarget             // no editable target / insertion failed outright
     case accessibilityMissing // insertion needs Accessibility, not granted (E2)
+    case pasteRejected        // the synthetic ⌘V was posted but the field never took it (E15)
 
     public var label: String {
         switch self {
@@ -18,6 +19,7 @@ public enum RecoveryReason: Equatable, Sendable {
         case .finalizationTimeout: return "Finalized late — not inserted"
         case .noTarget: return "No text field — not inserted"
         case .accessibilityMissing: return "Accessibility off — not inserted"
+        case .pasteRejected: return "Paste didn’t land — not inserted"
         }
     }
 }

@@ -13,7 +13,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
     private let recovery = RecoveryBuffer()
     private let inserter = TextInserter()
     private let audio = AudioCapture()
-    private lazy var engine = SpeechEngine(locale: Settings.shared.locale)
+    // Seed the biasing preference so the very first dictation's PREPARED session is already the
+    // vocabulary-capable kind, instead of having to build one inline on the hotkey path.
+    private lazy var engine = SpeechEngine(locale: Settings.shared.locale,
+                                           biasing: !Settings.shared.vocabulary.isEmpty)
     private lazy var coordinator = SessionCoordinator(
         audio: audio, engine: engine, inserter: inserter,
         recovery: recovery, permissions: permissions, feedback: feedback)
@@ -60,6 +63,21 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         do { try await engine.warmUp() }
         catch { Log.speech.error("warmUp failed: \(error.localizedDescription)") }
         await coordinator.refreshReadiness()
+        await ensureVocabularyBiasingUsable()
+    }
+
+    /// A custom vocabulary only biases recognition on `DictationTranscriber`, whose asset is NOT
+    /// implied by the one an existing install already has. Fetch it in the background once, after warm
+    /// -up, so the advertised feature actually works instead of silently degrading — and tell the user
+    /// if it can't be had, since the alternative is a Settings pane promising something inert.
+    private func ensureVocabularyBiasingUsable() async {
+        guard !Settings.shared.vocabulary.isEmpty else { return }
+        guard await !engine.biasingAssetInstalled() else { return }
+        if await engine.ensureBiasingAsset() {
+            Log.speech.notice("Custom vocabulary is now active")
+        } else {
+            coordinator.reportVocabularyUnavailable()
+        }
     }
 
     private func refreshAndWarm() async {
@@ -79,6 +97,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
             _ = coordinator.elapsed
             _ = coordinator.audioLevel
             _ = coordinator.volatilePreview
+            _ = coordinator.notice
         } onChange: { [weak self] in
             // startObserving() re-renders as its first line, then re-subscribes.
             Task { @MainActor in self?.startObserving() }
@@ -87,13 +106,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     private func render() {
         statusItem.updateIcon()
-        switch coordinator.state {
-        case .idle:
-            indicator.hide()
-        case .recording, .finalizing, .inserting:
+        // Driven by `indicatorVisible`, not by state alone: a terminal notice (text saved to the menu,
+        // nothing heard, mic lost) keeps the panel up briefly after the session returns to idle, so a
+        // failed dictation doesn't collapse exactly like a successful one.
+        if coordinator.indicatorVisible {
             // First call shows the panel; while visible, show() is just a content update. The
             // controller decides notch vs pill.
             indicator.show(content: coordinator.indicatorContent())
+        } else {
+            indicator.hide()
         }
     }
 
@@ -217,7 +238,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
     private func handleFixReadiness() {
         switch coordinator.readiness {
         case .needsPermission(let missing):
+            // Also open the guided setup window, not just the System Settings deep links: it is the
+            // screen that explains what each grant is for and carries the per-permission reset.
             for kind in missing { permissions.openSettings(for: kind) }
+            showOnboarding()
         case .needsModel:
             showOnboarding()
         default:

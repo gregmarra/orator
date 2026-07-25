@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Speech
 import Observation
@@ -20,6 +21,25 @@ public final class SessionCoordinator: SpeechResultSink {
     public private(set) var volatilePreview: String = ""
     /// A legible reason for the most recent failure (E5), surfaced in the menu tooltip.
     public private(set) var lastError: String?
+    /// When `lastError` was set — an error is an *event*, not a standing condition, so it stops being
+    /// shown once it has outlived its truth (see `recentError`).
+    private var lastErrorAt: Date?
+    /// A transient end-of-dictation message for the indicator: shown when the outcome was NOT a clean
+    /// insert, so "saved to the menu", "heard nothing", and "lost the microphone" are never
+    /// indistinguishable from success (ORA-REL-001).
+    public private(set) var notice: String?
+    private var noticeTask: Task<Void, Never>?
+
+    /// How long a `lastError` stays worth showing. Past this it is stale, and a live readiness problem
+    /// is the more useful thing to surface.
+    private static let errorRelevance: TimeInterval = 120
+
+    /// `lastError`, but only while it is still recent.
+    public var recentError: String? {
+        guard let lastError, let at = lastErrorAt,
+              now().timeIntervalSince(at) < Self.errorRelevance else { return nil }
+        return lastError
+    }
 
     /// Derived menu-bar glyph (ORA-IND-001).
     public var glyph: IndicatorGlyph { .from(state: state, readiness: readiness) }
@@ -27,13 +47,15 @@ public final class SessionCoordinator: SpeechResultSink {
     // Confirmed accumulator — the sacred text (ORA-SM-002).
     private var confirmedText: String = ""
 
-    // Collaborators.
-    private let audio: AudioCapture
+    // Collaborators. Audio and insertion are protocol-typed so the state machine can be driven
+    // headlessly (see `AudioSource` / `TextInserting`).
+    private let audio: any AudioSource
     private let engine: SpeechEngine
-    private let inserter: TextInserter
+    private let inserter: any TextInserting
     public let recovery: RecoveryBuffer
     private let permissions: PermissionsManager
     private let feedback: SoundFeedback
+    private let now: @MainActor () -> Date
     private var escapeTap: EscapeTap?
 
     // Session bookkeeping.
@@ -48,13 +70,28 @@ public final class SessionCoordinator: SpeechResultSink {
     private var starting = false
     private var bridgeTask: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
+    /// The live engine session, kept so a mid-dictation microphone change can bridge a fresh capture
+    /// stream into the SAME transcription instead of starting over.
+    private var sessionToken: SpeechEngine.SessionToken?
+    /// Microphone failovers used by the current dictation, so a flapping device can't loop.
+    private var failoverCount = 0
+    private static let maxFailovers = 2
+    /// UIDs that already failed during this dictation; excluded from failover device resolution.
+    private var failedDeviceUIDs: Set<String> = []
+    /// Loudest level seen this dictation. Diagnostic only: it separates "the mic delivered silence"
+    /// from "audio arrived but the recognizer returned nothing", which look identical to the user.
+    private var peakLevel: Float = 0
 
     private let debounce: TimeInterval = 0.030            // ORA-ACT-004
     private let maxDuration: TimeInterval = 30 * 60       // ORA-SM-010
     private let finalizationCap: Duration = .milliseconds(2500)  // ORA-ASR-003 / M3
 
-    public init(audio: AudioCapture, engine: SpeechEngine, inserter: TextInserter,
-                recovery: RecoveryBuffer, permissions: PermissionsManager, feedback: SoundFeedback) {
+    /// `now` is injectable so error-expiry is testable without wall-clock waits (same idiom as
+    /// `RecoveryBuffer`).
+    public init(audio: any AudioSource, engine: SpeechEngine, inserter: any TextInserting,
+                recovery: RecoveryBuffer, permissions: PermissionsManager, feedback: SoundFeedback,
+                now: @escaping @MainActor () -> Date = { Date() }) {
+        self.now = now
         self.audio = audio
         self.engine = engine
         self.inserter = inserter
@@ -65,15 +102,96 @@ public final class SessionCoordinator: SpeechResultSink {
         // If capture can't be resumed after a device change, abort cleanly rather than sit in
         // `.recording` with a dead mic and a live indicator (ORA-REL-001 "no stuck state").
         audio.onUnrecoverableFailure = { [weak self] reason in
-            Task { @MainActor in self?.abortSession(reason: reason) }
+            Task { @MainActor in self?.handleCaptureFailure(reason: reason) }
         }
     }
 
-    /// Abort an in-progress dictation, preserving already-confirmed text in recovery (never lost).
+    /// Capture died mid-dictation (device unplugged, session faulted, buffers stopped arriving).
+    ///
+    /// The confirmed text lives here, outside the audio and engine object lifecycles (ORA-SM-002),
+    /// precisely so this is survivable — so the FIRST response is to move to another microphone and
+    /// keep the same dictation going (ORA-CAP-003 / E6). Only when there is nowhere to go do we end
+    /// the dictation, and then we end it *properly*: finalize and insert, exactly like a normal stop.
+    private func handleCaptureFailure(reason: String) {
+        // Only an ACTIVE recording is affected. During `.finalizing`/`.inserting` capture is already
+        // stopped, so a late/stale mic-loss callback must NOT run — it would divert the
+        // just-transcribed text to recovery instead of inserting it (ORA-CAP-022).
+        guard state == .recording else { return }
+        Log.session.error("Capture failure: \(reason)")
+        if attemptFailover() { return }
+        setError(reason)
+        Task { await self.finishAfterCaptureLoss(reason: reason) }
+    }
+
+    /// Move the live dictation onto whatever microphone is usable now, keeping the SAME analyzer
+    /// session — the engine's token is per-transcription, not per-capture, so a fresh capture stream
+    /// bridges straight into it and the confirmed text is untouched. Device re-resolution is
+    /// `resolveUID`'s existing job: a pinned mic that vanished falls back to the default here, and
+    /// re-engages on its own when it comes back.
+    ///
+    /// A second or two of speech is lost across the switch — a seam in the transcript, versus losing
+    /// the dictation. Bounded, so a device that flaps can't spin here forever.
+    private func attemptFailover() -> Bool {
+        guard failoverCount < Self.maxFailovers,
+              let token = sessionToken,
+              let format = engine.inputFormat else { return false }
+
+        // Retire the device that just failed BEFORE re-resolving. A mic that dies without faulting the
+        // session still enumerates and still looks usable, so without this the resolver hands back the
+        // same dead device and every attempt is spent on it.
+        if let failed = audio.currentDeviceUID { failedDeviceUIDs.insert(failed) }
+        audio.stop()
+        bridgeTask?.cancel(); bridgeTask = nil
+
+        let stream: AsyncStream<AnalyzerInput>
+        do { stream = try audio.start(outputFormat: format, excluding: failedDeviceUIDs) }
+        catch {
+            // Only excluded devices left ⇒ there is genuinely nowhere to go; the caller ends the
+            // dictation properly rather than burning the remaining attempts.
+            Log.session.error("Failover found no usable microphone: \(error.localizedDescription)")
+            return false
+        }
+        failoverCount += 1
+        bridgeTask = Task.detached { [engine] in
+            for await input in stream { engine.feed(input, for: token) }
+        }
+        // Deliberately NO user-facing notice: `notice` is a terminal message that replaces the live
+        // preview and hides the elapsed timer, so raising one mid-session reads as "the dictation just
+        // ended" — the exact signal failover exists to avoid. A working failover should be seamless.
+        Log.session.notice("Failed over to another microphone; session continues")
+        return true
+    }
+
+    /// No microphone left: end the dictation the same way a deliberate stop does. Previously this
+    /// dumped the confirmed text straight into the recovery menu, which threw away a perfectly good
+    /// paste into a target that was still focused — the same mistake the finalization-timeout path
+    /// used to make. Insertion re-verifies the frontmost app (ORA-INS-002), so recovery stays the
+    /// fallback rather than the default.
+    private func finishAfterCaptureLoss(reason: String) async {
+        guard state == .recording else { return }
+        state = .finalizing
+        teardownCapture()   // discard, not drain: the device is gone, there is nothing left to arrive
+
+        let finished = await engine.finalize(within: finalizationCap)
+        await drainConfirmed(upTo: .milliseconds(250))
+
+        // Tail read AFTER the drain — see `resolveText`.
+        let text = TranscriptCleaner.clean(Self.resolveText(confirmed: confirmedText,
+                                                            tail: volatilePreview,
+                                                            finished: finished))
+        volatilePreview = ""
+        engine.endSession()
+
+        state = .inserting
+        await insert(text, timedOut: !finished, lossReason: reason)
+        state = .idle
+        startInstant = nil
+        sessionToken = nil
+    }
+
+    /// Abort without finalizing — for a session that never had a transcriber attached, so there is
+    /// nothing to finalize or insert.
     private func abortSession(reason: String) {
-        // Only an ACTIVE recording is abortable. During `.finalizing` capture is already stopped, so a
-        // late/stale mic-loss callback must NOT run — it would divert the just-transcribed text to
-        // recovery instead of inserting it (ORA-CAP-022).
         guard state == .recording else { return }
         Log.session.error("Session aborted: \(reason)")
         teardownCapture()
@@ -81,8 +199,52 @@ public final class SessionCoordinator: SpeechResultSink {
         if !confirmedText.isEmpty { recovery.add(confirmedText, reason: .noTarget) }
         confirmedText = ""
         volatilePreview = ""
-        lastError = reason
+        setError(reason)
         state = .idle
+        sessionToken = nil
+        // An abort that only logged left the user talking into a dead session with no cue and no
+        // message. Sound it and hold the reason on-screen briefly (E5 / ORA-REL-001).
+        feedback.playError()
+        showNotice(reason)
+    }
+
+    /// Surface that custom vocabulary can't take effect (the biasing model isn't available), so the
+    /// Settings pane isn't quietly advertising an inert feature. Dictation itself is unaffected, so
+    /// this is an error string for the menu tooltip only — no cue, no indicator interruption.
+    public func reportVocabularyUnavailable() {
+        setError("Custom vocabulary isn’t active — the dictation model couldn’t be installed.")
+    }
+
+    /// Record a failure reason, timestamped so it can go stale (see `recentError`).
+    private func setError(_ reason: String) {
+        lastError = reason
+        lastErrorAt = now()
+    }
+
+    private func clearError() {
+        lastError = nil
+        lastErrorAt = nil
+    }
+
+    /// Hold `text` in the indicator briefly after the session ends, and speak it to VoiceOver — the
+    /// panel is a decorative overlay VoiceOver never focuses.
+    private func showNotice(_ text: String, for duration: Duration = .milliseconds(1600)) {
+        notice = text
+        NSAccessibility.post(element: NSApp as Any, notification: .announcementRequested,
+                             userInfo: [.announcement: text,
+                                        .priority: NSAccessibilityPriorityLevel.high.rawValue])
+        noticeTask?.cancel()
+        noticeTask = Task { [weak self] in
+            try? await Task.sleep(for: duration)
+            guard !Task.isCancelled else { return }
+            self?.notice = nil
+        }
+    }
+
+    /// Drop any showing notice immediately (a new dictation supersedes the last one's outcome).
+    private func clearNotice() {
+        noticeTask?.cancel(); noticeTask = nil
+        notice = nil
     }
 
     // MARK: Readiness (ORA-PERM-002/003)
@@ -144,6 +306,9 @@ public final class SessionCoordinator: SpeechResultSink {
         confirmedText = ""
         volatilePreview = ""
         engine.endSession()   // drop unfinalized audio so it can't bleed into the next session
+        clearError()          // the user resolved the session deliberately; nothing is wrong now
+        clearNotice()
+        sessionToken = nil
         state = .idle             // no insertion, no recovery entry
     }
 
@@ -155,7 +320,12 @@ public final class SessionCoordinator: SpeechResultSink {
         guard state == .idle else { return }
         guard engine.isWarm, let format = engine.inputFormat else {
             Log.session.error("Cannot start: engine not warm")
-            readiness = .needsModel(await engine.modelStatus())
+            // As in the `beginSession` failure below: only claim a MODEL problem when the model really
+            // is the problem. An engine that failed to warm with the asset present is a transient
+            // fault, and `.needsModel(.installed)` would disable the hotkey outright.
+            let status = await engine.modelStatus()
+            if status != .installed { readiness = .needsModel(status) }
+            else { setError("Speech engine isn’t ready yet — try again.") }
             feedback.playError()
             return
         }
@@ -165,11 +335,15 @@ public final class SessionCoordinator: SpeechResultSink {
         guard permissions.microphoneGranted else {
             Log.session.error("Cannot start: microphone permission not granted")
             readiness = .needsPermission(permissions.missing())
-            lastError = "Microphone access is off. Enable it in System Settings."
+            setError("Microphone access is off. Enable it in System Settings.")
             feedback.playError()
             return
         }
 
+        clearNotice()   // this dictation supersedes the previous one's outcome message
+        failoverCount = 0
+        failedDeviceUIDs = []   // a fresh dictation re-trusts every device
+        peakLevel = 0
         target = TargetContext.capture()
         confirmedText = ""
         volatilePreview = ""
@@ -185,7 +359,7 @@ public final class SessionCoordinator: SpeechResultSink {
         } catch {
             // Capture failed to start ⇒ stay idle, no indicator, legible reason (ORA-SM-004 / E5).
             Log.session.error("Audio start failed: \(error.localizedDescription)")
-            lastError = "Couldn’t start the microphone."
+            setError("Couldn’t start the microphone.")
             feedback.playError()
             return
         }
@@ -193,22 +367,48 @@ public final class SessionCoordinator: SpeechResultSink {
         // Enter recording ONLY after capture actually started (ORA-SM-004).
         state = .recording
         startInstant = ContinuousClock.now
-        lastError = nil
+        clearError()
         DebugLog.stage("start→capturing", ms: (ContinuousClock.now - began).milliseconds)   // M1 (ORA-PERF-004)
         feedback.playStart()                                      // non-blocking cue (overlapped)
-        await engine.beginSession(vocabulary: Settings.shared.vocabulary)  // set vocab before feeding
+        let token = await engine.beginSession(vocabulary: Settings.shared.vocabulary)  // set vocab before feeding
 
         // `beginSession` is a suspension point: a second hotkey press during it runs stopAndInsert →
         // teardownCapture concurrently. If we resumed here on a torn-down session we'd wire an orphan
         // bridge/tick that feeds audio into the engine AFTER endSession (duplicate/garbled text) and
         // ticks past teardown. Bail if the session is no longer recording (ORA-SM-014).
-        guard state == .recording else { return }
+        guard state == .recording else {
+            // REAP the session we just started. Whoever ended the dictation called `endSession()`
+            // before `beginSession` resumed, so its analyzer, results task and input continuation were
+            // installed after that teardown and now belong to nobody — and `.processLifetime` model
+            // retention means an orphan holds the model until some later `beginSession` happens to
+            // tear it down. `toggle()`'s `starting` guard means no NEWER session can exist here, so
+            // this can only be reaping our own.
+            if token != nil { engine.endSession() }
+            sessionToken = nil
+            return
+        }
+
+        // No transcriber attached ⇒ every buffer would be silently discarded while the indicator,
+        // timer and start cue all claim a live dictation. Fail loudly instead (ORA-REL-001).
+        guard let token else {
+            // Only downgrade readiness if the MODEL is actually the problem. `beginSession` also
+            // returns nil for a transient engine hiccup (prepare/start throwing, a busy speech daemon),
+            // and `.needsModel(.installed)` still fails `canStartDictation` — which would kill the
+            // hotkey and point Setup at downloading an already-installed model, with recovery only on
+            // the next menu-open. The abort's own error + notice already explain the failure.
+            let status = await engine.modelStatus()
+            if status != .installed { readiness = .needsModel(status) }
+            abortSession(reason: "Couldn’t start transcription.")
+            return
+        }
+        sessionToken = token
 
         // Bridge audio → engine (the audio consumer). Detached so buffers never hop the main actor
         // (the engine's `feed` is nonisolated). The engine's own single results task (ORA-CC-003)
-        // feeds this coordinator back via SpeechResultSink.
+        // feeds this coordinator back via SpeechResultSink. The token makes a bridge that outlives its
+        // session a no-op rather than a source of cross-session bleed.
         bridgeTask = Task.detached { [engine] in
-            for await input in stream { engine.feed(input) }
+            for await input in stream { engine.feed(input, for: token) }
         }
         startTicking()
         // Defer the Escape event-tap: creating a CGEvent tap is synchronous main-thread work that
@@ -226,8 +426,6 @@ public final class SessionCoordinator: SpeechResultSink {
         guard state == .recording else { return }
         let stopped = ContinuousClock.now
         state = .finalizing
-        // Snapshot the volatile tail before teardown/finalize: fallback if a clean finalize yields no confirmed text.
-        let tailAtStop = volatilePreview
         await teardownCaptureDraining()   // graceful stop: DRAIN trailing buffers (don't drop them)
 
         let finished = await engine.finalize(within: finalizationCap)
@@ -237,41 +435,103 @@ public final class SessionCoordinator: SpeechResultSink {
         // by `speechDidConfirm` — this closes the drop-the-tail race. Bounded ≤ ~250 ms (inside M2).
         await drainConfirmed(upTo: .milliseconds(250))
 
-        var finalText = confirmedText
-        if finished, finalText.isEmpty { finalText = tailAtStop }   // fallback: nothing confirmed
-        finalText = TranscriptCleaner.clean(finalText)              // strip stray leading punctuation, fix casing
-        let unfinalizedTail = finished ? "" : tailAtStop
+        let finalText = TranscriptCleaner.clean(Self.resolveText(confirmed: confirmedText,
+                                                                 tail: volatilePreview,
+                                                                 finished: finished))
         volatilePreview = ""
         engine.endSession()   // drop anything still unfinalized so it can't cross into next session
 
         state = .inserting
-        await insert(finalText, tail: unfinalizedTail)
+        await insert(finalText, timedOut: !finished)
         DebugLog.stage("stop→inserted", ms: (ContinuousClock.now - stopped).milliseconds)   // M2
         state = .idle
         startInstant = nil
+        sessionToken = nil
     }
 
-    private func insert(_ text: String, tail: String) async {
-        // Park the unfinalized tail FIRST, before any early return, so it is never lost even when
-        // there is no target (ORA-ASR-003 / ORA-REC-004 / E7 / M4).
-        if !tail.isEmpty { recovery.add(tail, reason: .finalizationTimeout) }
-
+    /// Terminal step. Every exit gives the user a DISTINCT signal: the success cue only for a real
+    /// insert, and an explicit on-screen reason otherwise. Previously the deferred-to-recovery path
+    /// played the identical success cue and the two "nothing happened" cases were silent — so in the
+    /// supported accessibility-missing degraded mode (E2) every dictation sounded exactly like success
+    /// while quietly landing in a menu whose entries the 5-minute TTL then deleted.
+    /// `timedOut` records that `text` includes an unfinalized tail (ORA-ASR-003 / E7), so a failure to
+    /// insert is filed under the reason the user can act on.
+    /// `lossReason`, when set, means the dictation ended because capture died rather than because the
+    /// user stopped it — the text still gets placed, but the user is told what happened to the mic.
+    private func insert(_ text: String, timedOut: Bool, lossReason: String? = nil) async {
         guard let target else {
-            if !text.isEmpty { recovery.add(text, reason: .noTarget) }
+            // No target at all — the one case where text genuinely cannot be placed (M4).
+            if !text.isEmpty {
+                recovery.add(text, reason: timedOut ? .finalizationTimeout : .noTarget)
+                deferredFeedback(timedOut ? .finalizationTimeout : .noTarget)
+            } else {
+                emptyResultFeedback(lossReason)
+            }
             return
         }
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty else { emptyResultFeedback(lossReason); return }
 
         let outcome = await inserter.insert(text, into: target,
                                             accessibilityGranted: permissions.accessibilityGranted)
-        feedback.playStop()   // completion cue on either outcome, fired immediately (ORA-INS-005)
         switch outcome {
         case .inserted:
+            feedback.playStop()                      // the completion cue means INSERTED, nothing else
             recovery.add(text, reason: .inserted)    // keep briefly so a stray paste is recoverable
+            // The text landed, but the mic still died — say so, and KEEP the error: clearing it here
+            // would erase the record of a hardware problem the user still has, just because this
+            // dictation happened to survive it.
+            if let lossReason { showNotice(lossReason) }
+            else { clearError() }                    // a clean dictation clears any prior failure
         case .deferredToRecovery(let reason):
             recovery.add(text, reason: reason)       // no text lost (M4)
             Log.insert.notice("Routed to recovery: \(String(describing: reason))")
+            deferredFeedback(reason)
         }
+    }
+
+    /// The text a finished session should place, from the confirmed accumulator plus whatever volatile
+    /// tail is left.
+    ///
+    /// `tail` MUST be read *after* `drainConfirmed`, never snapshotted before it. Late finals arriving
+    /// during the drain are appended to `confirmed` and clear `volatilePreview` (see
+    /// `speechDidConfirm`), so a pre-drain snapshot names text that is now already confirmed — joining
+    /// it would insert those words a second time, into the user's document.
+    static func resolveText(confirmed: String, tail: String, finished: Bool) -> String {
+        // Finalization timed out ⇒ the leftover volatile tail is the best text we have for the part the
+        // recognizer never confirmed, so it goes in rather than being withheld (ORA-ASR-003).
+        if !finished { return joined(confirmed, tail) }
+        // Clean finalize ⇒ `confirmed` is authoritative; the tail is only a fallback for a session that
+        // confirmed nothing at all.
+        return confirmed.isEmpty ? tail : confirmed
+    }
+
+    /// Join confirmed text with a trailing volatile fragment, inserting a separating space only when
+    /// the boundary needs one — matching how `speechDidConfirm` accumulates.
+    private static func joined(_ head: String, _ tail: String) -> String {
+        guard !tail.isEmpty else { return head }
+        guard !head.isEmpty else { return tail }
+        if let last = head.last, !last.isWhitespace, let first = tail.first, !first.isWhitespace {
+            return head + " " + tail
+        }
+        return head + tail
+    }
+
+    /// Text was saved but not inserted: name the reason on-screen and point at where it went.
+    private func deferredFeedback(_ reason: RecoveryReason) {
+        feedback.playError()
+        showNotice("\(reason.label) — saved to the menu")
+    }
+
+    /// A completed dictation that produced no text at all. Silence here reads as a broken app. When
+    /// capture died, the mic is the real explanation — "didn't catch anything" would misdirect.
+    ///
+    /// Logged, not just shown: "recorded fine but produced nothing" is the one outcome that otherwise
+    /// leaves NO trace in the unified log, which makes it the hardest failure to diagnose after the
+    /// fact — exactly when a user reports "transcription isn't working".
+    private func emptyResultFeedback(_ lossReason: String? = nil) {
+        Log.session.notice("Dictation produced no text (elapsed \(self.elapsed, format: .fixed(precision: 1))s, peak level \(self.peakLevel, format: .fixed(precision: 3)))")
+        feedback.playError()
+        showNotice(lossReason ?? "Didn’t catch anything")
     }
 
     // MARK: Auto-stop (ORA-SM-010) + elapsed clock + waveform level
@@ -285,13 +545,50 @@ public final class SessionCoordinator: SpeechResultSink {
                 guard let self, let start = self.startInstant else { break }
                 self.elapsed = (ContinuousClock.now - start).milliseconds / 1000   // monotonic seconds
                 self.audioLevel = self.audio.currentLevel
+                self.peakLevel = max(self.peakLevel, self.audioLevel)
                 if self.elapsed >= self.maxDuration {
-                    await self.stopAndInsert()        // auto-stop as a normal stop (E14)
+                    // Hand off to a FRESH task and leave the loop. Calling stopAndInsert() inline ran
+                    // the whole stop path inside tickTask — which stopTimersAndTaps cancels — so every
+                    // `try? await Task.sleep` on that path threw CancellationError immediately and was
+                    // swallowed: drainConfirmed collapsed to zero-elapsed iterations (dropping the late
+                    // finals it exists to collect) and the terminal settle delay was skipped. This keeps
+                    // auto-stop byte-identical to the manual stop path, as E14 claims (ORA-SM-010).
+                    Task { @MainActor [weak self] in await self?.stopAndInsert() }
                     break
                 }
+                self.checkCaptureAlive()
             }
         }
     }
+
+    /// Watchdog for capture that dies without an error (ORA-REL-001).
+    ///
+    /// The runtime-error notification only fires when the session itself faults, and it is further
+    /// gated on `!isRunning` — but a session whose input device is yanked commonly has the input
+    /// removed while still reporting `isRunning`, delivering zero buffers and no error. Nothing else
+    /// tracked whether audio was actually arriving, so a dead mic looked exactly like a live one until
+    /// the 30-minute cap. Silence still produces buffers, so this trips only on genuine capture death —
+    /// it is NOT the silence-based auto-stop ORA-SM-011 forbids.
+    ///
+    /// Gated on `.recording`: during `.finalizing` capture is deliberately stopped, and firing there
+    /// would divert the just-transcribed text to recovery (ORA-CAP-022).
+    private func checkCaptureAlive() {
+        guard state == .recording, let silent = audio.secondsSinceLastBuffer else { return }
+        // Two budgets, not one. Before the first buffer ever arrives we are watching a device WAKE UP:
+        // Bluetooth HFP link setup and Continuity/iPhone-mic activation routinely take 1–3 s, and
+        // applying the steady-state limit there kills a microphone that was about to work (and then
+        // re-opens the same slow device on failover, twice). Once audio has flowed, silence really
+        // does mean the device died, so the tight limit applies.
+        let limit = audio.hasDeliveredAudio ? Self.captureStallLimit : Self.captureStartupLimit
+        guard silent > limit else { return }
+        handleCaptureFailure(reason: "Lost the microphone.")
+    }
+
+    /// How long capture may deliver nothing, once it has delivered something, before it counts as
+    /// dead. Comfortably above any normal buffer interval (~10–100 ms).
+    private static let captureStallLimit: TimeInterval = 2.5
+    /// How long a device gets to produce its FIRST buffer before we give up on it.
+    private static let captureStartupLimit: TimeInterval = 8.0
 
     /// Discard-path teardown (cancel/abort): drop the bridge — its unconsumed buffers are intentionally
     /// thrown away.
@@ -376,6 +673,11 @@ public final class SessionCoordinator: SpeechResultSink {
     public func indicatorContent() -> IndicatorContent {
         let tail = [confirmedText, volatilePreview].filter { !$0.isEmpty }.joined(separator: " ")
         return IndicatorContent(state: state, elapsed: elapsed,
-                                level: audioLevel, previewTail: tail, isNotch: false)
+                                level: audioLevel, previewTail: tail, isNotch: false,
+                                notice: notice)
     }
+
+    /// True while the indicator has something to say — an active session, or a terminal notice being
+    /// held after one ended.
+    public var indicatorVisible: Bool { state != .idle || notice != nil }
 }

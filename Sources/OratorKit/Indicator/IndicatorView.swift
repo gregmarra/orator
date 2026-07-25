@@ -267,7 +267,13 @@ public struct IndicatorView: View {
     // MARK: Center — short preview tail (recording) or the status label
 
     @ViewBuilder private var center: some View {
-        if content.state == .recording {
+        if let notice = content.notice {
+            // A terminal outcome (saved to the menu / heard nothing / mic lost) outranks both the
+            // preview and the status label — it is the whole reason the panel is still on screen.
+            Text(notice)
+                .font(.system(size: 12, weight: .medium)).foregroundStyle(Color.white)
+                .lineLimit(1).truncationMode(.tail)
+        } else if content.state == .recording {
             Text(content.previewTail.isEmpty ? content.statusLabel : content.previewTail)
                 .font(.system(size: 12, weight: .regular))
                 .foregroundStyle(content.previewTail.isEmpty ? mutedStyle : Color.white)
@@ -283,6 +289,8 @@ public struct IndicatorView: View {
     // MARK: Trailing — elapsed time
 
     @ViewBuilder private var trailing: some View {
+        // The elapsed timer is tied to the SESSION, not to whether a message is showing. Hiding it
+        // whenever a notice exists made any mid-session message read as "the dictation ended".
         if content.state != .idle {
             Text(content.elapsedString)
                 .font(.system(size: 11, weight: .medium, design: .monospaced))

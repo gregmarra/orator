@@ -102,10 +102,17 @@ public final class StatusItemController: NSObject, NSMenuDelegate {
         }
     }
 
+    /// Readiness is a STANDING condition; `lastError` is an event. A stale error must not hide a live,
+    /// actionable "grant Microphone, Accessibility" — so readiness wins whenever it isn't `.ready`, and
+    /// the error is consulted only while it's still recent (`recentError`).
+    /// Test seam for the readiness-vs-error precedence rule below.
+    var tooltipForTesting: String { statusTooltip }
+
     private var statusTooltip: String {
-        if let err = coordinator?.lastError { return "Orator — \(err)" }
         switch coordinator?.readiness {
-        case .ready, .none: return "Orator — ready"
+        case .ready, .none:
+            if let err = coordinator?.recentError { return "Orator — \(err)" }
+            return "Orator — ready"
         case .degradedHotkey: return "Orator — hotkey degraded (secure input active)"
         case .needsPermission(let p): return "Orator — grant \(p.ordered.map(\.title).joined(separator: ", "))"
         case .needsModel: return "Orator — model setup needed"
@@ -171,6 +178,8 @@ public final class StatusItemController: NSObject, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+        // Settings is the SINGLE entry point (ORA-CFG-001): setup is reached from the button inside it,
+        // not from a competing top-level item.
         addItem(menu, "Settings…", #selector(openSettings), symbol: "gearshape", keyEquivalent: ",")
         addItem(menu, "Quit Orator", #selector(quit), keyEquivalent: "q")
     }

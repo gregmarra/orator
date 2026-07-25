@@ -75,8 +75,11 @@ public enum ModelStatus: Equatable, Sendable {
 
 /// Reads and requests TCC permissions. All checks are cheap and synchronous where the
 /// platform allows, so `PermissionsManager` can be re-polled on focus (ORA-PERM-002).
+/// Not `final`: the grant reads gate the coordinator's whole start path, so a headless test of the
+/// state machine has to be able to stand in for TCC (which is a property of the *test host*, not of
+/// anything under test).
 @MainActor
-public final class PermissionsManager {
+public class PermissionsManager {
     public init() {}
 
     // MARK: Reads (no prompt)

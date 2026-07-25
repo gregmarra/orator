@@ -328,8 +328,10 @@ Invariants (all MUST):
   stop a tail-flush (M2).*
 - ORA-ASR-003 (MUST): On stop, Orator MUST finalize the recognizer (flush the volatile tail into confirmed
   text) under a **bounded timeout** (default ~2500 ms, M3). If the timeout elapses, Orator MUST insert the
-  confirmed text obtained so far and treat the unfinalized tail per ORA-REC-004 (park it in the recovery
-  buffer) rather than block the user.
+  confirmed text obtained so far **together with the unfinalized volatile tail**, rather than block the user.
+  A slow finalize is not grounds for withholding text from a target that is still focused: insertion
+  re-verifies the frontmost app (ORA-INS-002), so a tail that genuinely cannot be placed still routes to the
+  recovery buffer per ORA-REC-004 — but that decision belongs to the insertion step, not to the timeout.
 - ORA-ASR-004 (MUST): Provisional/volatile results MAY be surfaced only in the indicator preview (§8.8) and
   MUST NOT be written to the target field.
 - ORA-ASR-005 (MUST): The recognizer instance and its model MUST be kept **resident/warm** for the app’s
@@ -358,8 +360,12 @@ Invariants (all MUST):
   terms) that biases recognition toward those terms.
 - ORA-VOC-002 (MUST): The vocabulary MUST be supplied to the recognizer through the Speech framework’s
   contextual mechanism — per-request contextual biasing via `AnalysisContext.contextualStrings[.general]`,
-  applied to the analyzer's context at session start with no prepare cost and no separate asset. Custom
-  *pronunciations* via `SFCustomLanguageModelData` are deferred (§17) and not needed for term biasing.
+  applied to the analyzer's context at session start. **Only `DictationTranscriber` honours contextual
+  strings**; `SpeechTranscriber` accepts the context without error and ignores it, so a session with a
+  non-empty vocabulary MUST run on `DictationTranscriber` (sessions with no vocabulary keep the default
+  `SpeechTranscriber`). Contextual strings are capped at 100 terms — an oversized array can drop the whole
+  set rather than the excess. Custom *pronunciations* via `SFCustomLanguageModelData` are deferred (§17) and
+  not needed for term biasing.
 - ORA-VOC-003 (SHOULD, deferred): A conservative post-recognition correction pass MAY repair systematic
   mis-splits of known custom terms (e.g. a multi-token rendering collapsing into a single vocabulary term).
   If built, it **MUST** operate only against the user’s explicit vocabulary, use a precision-first threshold,
@@ -682,8 +688,8 @@ The state machine is §7.2; the user-facing sequence:
 | E3 | Model asset missing/first run | Guided download with progress + retry; dictation blocked until present. (ORA-ASR-006) |
 | E4 | Model download fails / offline | First-class onboarding error state, ret/re-try; never an assert. |
 | E5 | No microphone / mic removed | Fail to start cleanly, return to idle, legible reason. (ORA-SM-004) |
-| E6 | Headset connects mid-dictation | Reinstall tap, rebuild converter, resume same session; confirmed text preserved. (ORA-CAP-003) |
-| E7 | Finalization stalls past cap | Insert confirmed text; park tail in recovery buffer; instrument the event. (ORA-ASR-003) |
+| E6 | Headset connects / mic unplugged mid-dictation | Fail over to the best remaining usable input and resume the SAME analyzer session (bounded retries, user told); confirmed text preserved. With no input left, end the dictation as a normal stop — finalize and insert — never dump straight to recovery. (ORA-CAP-003) |
+| E7 | Finalization stalls past cap | Insert confirmed text **plus the unfinalized tail** into the still-focused target; recovery only if insertion itself can't place it; instrument the event. (ORA-ASR-003) |
 | E8 | Focus changed before insert | Do not insert into the wrong app; route to recovery buffer. (ORA-INS-002) |
 | E9 | Target is a secure field | Do not insert; route to recovery buffer with reason. (ORA-INS-007) |
 | E10 | Global secure keyboard entry active | Reflect degraded hotkey/Escape; menu-driven fallback. (ORA-ACT-006) |
@@ -763,7 +769,8 @@ where a seam allows).
   results and a managed model-asset inventory on macOS 26 (Apple Silicon).
 - A2. The platform exposes focused-element access and programmatic text insertion via the Accessibility API,
   and global hotkey registration via the OS.
-- A3. Custom-vocabulary biasing is available per-request via `AnalysisContext.contextualStrings`.
+- A3. Custom-vocabulary biasing is available per-request via `AnalysisContext.contextualStrings` — but only
+  on `DictationTranscriber` (see ORA-VOC-002).
 - A4. The primary user’s Mac and friends’ Macs meet the platform floor (macOS 26, Apple Silicon).
 - A5. Notch geometry is queryable via the documented `NSScreen` APIs.
 

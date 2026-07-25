@@ -28,12 +28,19 @@ public struct IndicatorContent: Sendable, Equatable {
     /// (rationale on `IndicatorMetrics.spinnerActivationDelay`). Ignored when `morph` is set (harness path).
     public var spinnerActive: Bool = false
 
+    /// A terminal outcome message held briefly after the session ends (text saved to the menu, nothing
+    /// heard, mic lost). When set it REPLACES the status label, so a non-success outcome is visible
+    /// rather than collapsing exactly like a success.
+    public var notice: String?
+
     public init(state: SessionState, elapsed: TimeInterval,
                 level: Float, levels: [Float] = [], previewTail: String,
                 isNotch: Bool, notchBand: CGFloat? = nil,
-                morph: Double? = nil, staticClock: Double? = nil) {
+                morph: Double? = nil, staticClock: Double? = nil,
+                notice: String? = nil) {
         self.morph = morph
         self.staticClock = staticClock
+        self.notice = notice
         self.state = state
         self.elapsed = elapsed
         self.level = level

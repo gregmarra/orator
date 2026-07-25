@@ -4,7 +4,9 @@ import AppKit
 /// Audio ducking (ORA-FBK-002) intentionally not in v1: off-by-default, intrusive, adds surface for
 /// no required benefit.
 @MainActor
-public final class SoundFeedback {
+/// Not `final`: the coordinator's terminal-feedback contract (success cue ONLY on a real insert) is a
+/// behaviour worth asserting, and a test needs to both observe the cues and keep the suite silent.
+public class SoundFeedback {
     private let startSound = NSSound(named: "Tink")
     private let stopSound = NSSound(named: "Pop")
     private let errorSound = NSSound(named: "Funk")
