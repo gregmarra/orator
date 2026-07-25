@@ -25,6 +25,9 @@ final class MicLevelMonitor {
     /// Set when microphone TCC access isn't granted — capturing then "succeeds" but delivers silence
     /// (a permanently flat bar), so we detect it up front and tell the user to enable access.
     private(set) var permissionDenied = false
+    /// True while the input is hitting the rails. Distortion from clipping degrades recognition and
+    /// no downstream setting recovers it — the only fix is lowering the gain, so it has to be visible.
+    private(set) var clipping = false
 
     @ObservationIgnored private let capture = AudioCapture()
     @ObservationIgnored private var poll: Task<Void, Never>?
@@ -47,6 +50,7 @@ final class MicLevelMonitor {
         substituted = choice.substituted
         openFailure = nil
         permissionDenied = false
+        clipping = false
         level = 0
         // Denied TCC access doesn't throw — it silently delivers no samples — so detect it up front.
         guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
@@ -55,14 +59,15 @@ final class MicLevelMonitor {
         }
         guard choice.device != nil else { return }   // nothing usable → readout shows "no microphone"
         do {
-            // meteringOnly: the sink derives RMS from the raw buffer and never yields — so the stream
+            // Metering: the sink derives RMS from the raw buffer and never yields — so the stream
             // stays empty and we don't consume it (no backlog to drain).
-            _ = try capture.start(outputFormat: Self.format, meteringOnly: true)
+            _ = try capture.startMetering(outputFormat: Self.format)
             running = true
             poll = Task { [weak self] in
                 while !Task.isCancelled {
                     guard let self else { return }
                     self.level = Self.smooth(self.level, self.capture.currentLevel)
+                    self.clipping = self.capture.isClipping
                     try? await Task.sleep(for: .milliseconds(33))   // ~30 Hz, UI-only
                 }
             }

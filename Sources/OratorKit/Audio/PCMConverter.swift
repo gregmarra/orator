@@ -24,6 +24,20 @@ final class PCMConverter {
         // built from, so it doubles as the "current input format" without a shadow property.
         if converter?.inputFormat != pcm.format {
             converter = AVAudioConverter(from: pcm.format, to: outputFormat)
+            // Decimating 48 kHz → 16 kHz needs a steep anti-aliasing filter. At the default quality,
+            // energy above 8 kHz folds back INTO the speech band as distortion — it doesn't just lose
+            // detail, it corrupts what the recognizer hears. `.max` is the best filter available and
+            // costs almost nothing on mono 16 kHz buffers, so it never trades against latency.
+            converter?.sampleRateConverterQuality = AVAudioQuality.max.rawValue
+            // Belt and braces for multi-channel input. `AVCaptureAudioDataOutput` is asked for mono
+            // (see `AudioCapture.monoFloatSettings`), so this should never fire — but if any device
+            // ignores that request, `AVAudioConverter`'s implicit stereo→mono downmix produces
+            // SILENCE rather than an error. Measured: averaging the channels transcribes NOTHING
+            // (WER 1.00), while selecting one channel transcribes normally. Never leave the downmix
+            // implicit.
+            if pcm.format.channelCount > outputFormat.channelCount {
+                converter?.channelMap = (0..<Int(outputFormat.channelCount)).map { NSNumber(value: $0) }
+            }
         }
         guard let converter, pcm.frameLength > 0 else { return nil }
 
@@ -41,6 +55,31 @@ final class PCMConverter {
         guard status != .error, out.frameLength > 0 else { return nil }
         return out
     }
+
+    /// Absolute peak sample (0…1), for clipping detection. Unlike `rms` this is NOT floored or
+    /// compressed — clipping is about individual samples hitting the rails, which an averaged level
+    /// hides completely: a clipped signal and a merely loud one have almost the same RMS.
+    static func peak(_ buffer: AVAudioPCMBuffer) -> Float {
+        let n = Int(buffer.frameLength)
+        guard n > 0 else { return 0 }
+        var peak: Float = 0
+        if let data = buffer.floatChannelData {
+            let ch = data[0]
+            for i in 0..<n { peak = max(peak, abs(ch[i])) }
+        } else if let data = buffer.int16ChannelData {
+            let ch = data[0], scale: Float = 1.0 / 32768.0
+            for i in 0..<n { peak = max(peak, abs(Float(ch[i]) * scale)) }
+        } else if let data = buffer.int32ChannelData {
+            let ch = data[0], scale: Float = 1.0 / 2147483648.0
+            for i in 0..<n { peak = max(peak, abs(Float(ch[i]) * scale)) }
+        }
+        return min(peak, 1)
+    }
+
+    /// A sample this close to full scale is at the rails. Digital clipping flattens waveform peaks
+    /// into square edges, which the recognizer hears as broadband distortion — no downstream setting
+    /// recovers it, so the only fix is turning the gain down.
+    static let clippingThreshold: Float = 0.99
 
     /// Normalized RMS level (0…1, −50 dB floor) for the waveform meter. Format-agnostic: the analyzer's
     /// preferred format is often Int16 (not Float32), so reading only `floatChannelData` would return
