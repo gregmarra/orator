@@ -63,12 +63,36 @@ final class SentenceContextTests: XCTestCase {
 
     // MARK: Casing policy
 
-    /// We only ever ADD a capital, never remove one — the recognizer already casts proper nouns, and
-    /// forcing lower-case mid-sentence would turn "Michael" into "michael".
-    func testMidSentenceKeepsTheModelsCasingForProperNouns() {
-        let text = "Michael said yes"
-        XCTAssertFalse(SentenceContext.startsSentence(after: "I told "))
-        XCTAssertEqual(text, text, "continuation path must pass the text through untouched")
+    /// The recognizer capitalizes the first word of EVERY utterance, so a continuation arrives as
+    /// "Let's see" when "let's see" is wanted — declining to capitalize is not enough, it has to be
+    /// undone. Restricted to function words so a name can never be corrupted.
+    func testContinuationLowersOnlySafeLeadingWords() {
+        XCTAssertEqual(TranscriptCleaner.continuing("Let's see what happens"), "let's see what happens")
+        XCTAssertEqual(TranscriptCleaner.continuing("No, it's still capitalizing"), "no, it's still capitalizing")
+        XCTAssertEqual(TranscriptCleaner.continuing("And then we left"), "and then we left")
+        XCTAssertEqual(TranscriptCleaner.continuing("The waveform moved"), "the waveform moved")
+    }
+
+    /// The case this restraint exists for: a continuation can legitimately begin with a name.
+    func testContinuationNeverLowersAProperNoun() {
+        XCTAssertEqual(TranscriptCleaner.continuing("Michael said yes"), "Michael said yes")
+        XCTAssertEqual(TranscriptCleaner.continuing("Priya and I disagreed"), "Priya and I disagreed")
+        // Name detection alone MISSES these — they come back as plain nouns — so the rule keys on
+        // lexical class, which protects them anyway.
+        XCTAssertEqual(TranscriptCleaner.continuing("Orator is working"), "Orator is working")
+        XCTAssertEqual(TranscriptCleaner.continuing("Apple released it"), "Apple released it")
+        XCTAssertEqual(TranscriptCleaner.continuing("Tuesday works for me"), "Tuesday works for me")
+        XCTAssertEqual(TranscriptCleaner.continuing("Google that for me"), "Google that for me")
+        XCTAssertEqual(TranscriptCleaner.continuing("I think so"), "I think so",
+                       "'I' is a pronoun, but is always capitalized in English")
+    }
+
+    func testContinuationLeavesAlreadyLowercaseTextAlone() {
+        XCTAssertEqual(TranscriptCleaner.continuing("the waveform moved"), "the waveform moved")
+        XCTAssertEqual(TranscriptCleaner.continuing(""), "")
+    }
+
+    func testCapitalizationAtASentenceStartIsUnchanged() {
         XCTAssertEqual(TranscriptCleaner.capitalized("the waveform"), "The waveform")
         XCTAssertEqual(TranscriptCleaner.capitalized("Michael"), "Michael")
     }

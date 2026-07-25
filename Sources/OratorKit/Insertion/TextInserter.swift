@@ -81,7 +81,8 @@ public final class TextInserter {
             app=\(target.bundleID ?? "unknown", privacy: .public) \
             \(self.describeAXCapabilities(element), privacy: .public)
             """)
-        var toInsert = startsSentence ? TranscriptCleaner.capitalized(text) : text
+        var toInsert = startsSentence ? TranscriptCleaner.capitalized(text)
+                                      : TranscriptCleaner.continuing(text)
         if SentenceContext.needsLeadingSpace(after: preceding) { toInsert = " " + toInsert }
         return await paste(toInsert, settle: delay, element: element)
     }

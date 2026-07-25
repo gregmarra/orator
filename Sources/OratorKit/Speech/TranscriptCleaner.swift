@@ -1,9 +1,12 @@
 import Foundation
+import NaturalLanguage
 
-/// Post-processes a finalized transcript before insertion (ORA-ASR-007). The `SpeechTranscriber`
-/// renders the opening pause/breath of a fresh utterance as stray leading punctuation ("..", ",...",
-/// "…") and fails to capitalize the first real word; trim that leading junk and apply sentence-start
-/// capitalization. Internal punctuation and casing (which the model gets right) are left untouched.
+/// Post-processes a finalized transcript before insertion (ORA-ASR-007). The recognizer renders the
+/// opening pause/breath of a fresh utterance as stray leading punctuation ("..", ",...", "…"), which
+/// is trimmed here. Casing of the first word is decided later, by the insertion step, from what
+/// actually precedes the caret: every utterance looks like a new sentence to the recognizer, so the
+/// leading capital it produces is right only when the dictation really does start one. Internal
+/// punctuation and casing (which the model gets right) are left untouched.
 enum TranscriptCleaner {
     /// Punctuation the recognizer spuriously emits for a leading silence. Quotes, brackets, numbers,
     /// and currency are intentionally NOT stripped — only sentence-delimiter punctuation.
@@ -21,11 +24,44 @@ enum TranscriptCleaner {
 
     /// Apply sentence-start capitalization. `uppercased()` is a no-op on an already-capital or
     /// non-cased first character, so this is safe to apply unconditionally where a sentence starts.
-    ///
-    /// Note the asymmetry: we only ever capitalize, never lower-case. The model already casts proper
-    /// nouns correctly, so leaving its casing alone mid-sentence keeps "Michael" while still writing
-    /// "the" — whereas forcing lower-case would corrupt every name.
+    /// The mirror of `continuing(_:)`, which undoes a capital where the sentence carries on.
     static func capitalized(_ text: String) -> String {
         text.prefix(1).uppercased() + text.dropFirst()
+    }
+
+    /// Parts of speech that are safe to lower-case when continuing a sentence. Everything a proper
+    /// noun could be — Noun above all — is deliberately absent, so a continuation that begins with a
+    /// name keeps its capital.
+    ///
+    /// Grammatical class, not a word list: a list would be arbitrary, forever incomplete, and English
+    /// only, while `NLTagger` covers every language the recognizer does. Name detection alone is not
+    /// enough — it correctly flags "Michael" and "Google" but misses "Apple", "Orator" and "Tuesday",
+    /// all of which come back as plain nouns; keying on the class catches those too.
+    private static let lowercasableClasses: Set<NLTag> = [
+        .verb, .adverb, .conjunction, .determiner, .preposition, .interjection, .pronoun, .particle,
+    ]
+
+    /// Undo the recognizer's utterance-start capital when this text continues an existing sentence.
+    ///
+    /// The recognizer capitalizes the first word of EVERY utterance — each dictation looks like a
+    /// fresh sentence to it — so continuing after a comma yields "Let's" where "let's" is wanted.
+    /// Declining to capitalize is not enough; the capital has to be undone.
+    ///
+    /// Conservative by design: anything that might be a name is left exactly as recognized. A stray
+    /// capital is a far smaller error than a mangled name.
+    static func continuing(_ text: String, locale: Locale = .current) -> String {
+        guard let first = text.first, first.isUppercase else { return text }
+        // "I" is a pronoun, and so lower-caseable by class, but is always capitalized in English.
+        let bareWord = text.prefix { !$0.isWhitespace }.filter { $0.isLetter }
+        if bareWord == "I" { return text }
+
+        let tagger = NLTagger(tagSchemes: [.lexicalClass])
+        tagger.string = text
+        if let code = locale.language.languageCode?.identifier {
+            tagger.setLanguage(NLLanguage(code), range: text.startIndex..<text.endIndex)
+        }
+        let (tag, _) = tagger.tag(at: text.startIndex, unit: .word, scheme: .lexicalClass)
+        guard let tag, lowercasableClasses.contains(tag) else { return text }
+        return text.prefix(1).lowercased() + text.dropFirst()
     }
 }
