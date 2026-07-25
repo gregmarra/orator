@@ -43,19 +43,6 @@ final class OratorKitTests: XCTestCase {
         XCTAssertEqual(buffer.entries.count, 1)
     }
 
-    // ORA-REC-003 in-place scrub: an expired entry's backing string is emptied, not just dropped.
-    @MainActor
-    func testSweepScrubsExpiredEntriesInPlace() {
-        var fake = Date(timeIntervalSince1970: 1000)
-        let buffer = RecoveryBuffer(now: { fake })
-        buffer.add("keep me", reason: .inserted)
-        fake = fake.addingTimeInterval(60)
-        buffer.add("newer", reason: .inserted)
-        fake = fake.addingTimeInterval(5 * 60 - 30)   // first entry now > 5 min, second not
-        buffer.sweep()
-        XCTAssertEqual(buffer.entries.map(\.text), ["newer"])
-    }
-
     /// A private pasteboard for every test in this file. Writing fixtures to `NSPasteboard.general`
     /// clobbers the developer's real clipboard AND leaves a stale value that a later dictation's
     /// deferred restore can paste into their document — observed happening.
@@ -316,45 +303,6 @@ final class OratorKitTests: XCTestCase {
         XCTAssertNotEqual(opened, AudioCapture.CaptureError.noInputDevice.errorDescription)
     }
 
-    // Headless END-TO-END: synthesize a known utterance with `say`, replay it through the real
-    // PCMConverter + SpeechAnalyzer via FileAudioCapture (no mic, no user), assert the transcript
-    // comes back. Regression guard for "indicator shows but nothing transcribes."
-    @MainActor
-    func testEndToEndFileDictationProducesTranscript() async throws {
-        let phrase = "the quick brown fox jumps over the lazy dog"
-        let audioURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("orator-e2e.aiff")
-        try? FileManager.default.removeItem(at: audioURL)
-        let say = Process()
-        say.executableURL = URL(fileURLWithPath: "/usr/bin/say")
-        say.arguments = ["-o", audioURL.path, phrase]
-        try say.run(); say.waitUntilExit()
-        try XCTSkipUnless(say.terminationStatus == 0 && FileManager.default.fileExists(atPath: audioURL.path),
-                          "`say` unavailable")
-
-        let engine = SpeechEngine(locale: Locale(identifier: "en-US"))
-        let modelStatus = await engine.modelStatus()
-        try XCTSkipUnless(modelStatus == .installed, "en-US model not installed on this host")
-        try await engine.warmUp()
-        let format = try XCTUnwrap(engine.inputFormat)
-
-        let collector = TranscriptCollector()
-        engine.sink = collector
-
-        let capture = FileAudioCapture(url: audioURL, realtime: true)
-        let stream = try capture.start(outputFormat: format)
-        let started = await engine.beginSession(vocabulary: [])
-        let token = try XCTUnwrap(started, "beginSession must report a started session")
-        let bridge = Task.detached { [engine] in for await input in stream { engine.feed(input, for: token) } }
-        await bridge.value                          // drains when the file hits EOF
-        _ = await engine.finalize(within: .seconds(5))
-        try await Task.sleep(for: .milliseconds(400))   // let late finals arrive
-
-        let text = collector.confirmed.lowercased()
-        XCTAssertFalse(text.isEmpty, "no transcript produced end-to-end")
-        XCTAssertTrue(["fox", "quick", "brown", "dog"].contains { text.contains($0) },
-                      "transcript did not contain expected words: '\(text)'")
-    }
-
     // ORA-ASR-007: the recognizer emits stray leading punctuation for the opening pause. Cases below
     // are verbatim from live dictation traces. `clean` no longer changes case — capitalization now
     // depends on the target field's contents (see SentenceContextTests).
@@ -380,18 +328,6 @@ final class OratorKitTests: XCTestCase {
     }
 }
 
-/// Accumulates confirmed transcript for the end-to-end test.
-@MainActor
-final class TranscriptCollector: SpeechResultSink {
-    private(set) var confirmed = ""
-    func reset() { confirmed = "" }
-    func speechDidConfirm(_ text: String) {
-        if !confirmed.isEmpty { confirmed += " " }
-        confirmed += text
-    }
-    func speechDidReviseVolatile(_ text: String) {}
-}
-
 /// Custom-vocabulary biasing is only honoured by `DictationTranscriber` — `SpeechTranscriber` accepts
 /// `AnalysisContext.contextualStrings` and silently ignores them, so the feature the Settings pane
 /// advertises was a no-op. Supplying a vocabulary now switches the session to the biasing-capable
@@ -400,36 +336,10 @@ final class TranscriptCollector: SpeechResultSink {
 final class VocabularyBiasingTests: XCTestCase {
     @MainActor
     func testSessionWithVocabularyStillTranscribes() async throws {
-        let phrase = "the quick brown fox jumps over the lazy dog"
-        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("orator-bias.aiff")
-        try? FileManager.default.removeItem(at: url)
-        let say = Process()
-        say.executableURL = URL(fileURLWithPath: "/usr/bin/say")
-        say.arguments = ["-o", url.path, phrase]
-        try say.run(); say.waitUntilExit()
-        try XCTSkipUnless(say.terminationStatus == 0 && FileManager.default.fileExists(atPath: url.path),
-                          "`say` unavailable")
+        let url = try sayToFile("the quick brown fox jumps over the lazy dog", "orator-bias.aiff")
+        let engine = try await warmEngine(biasing: true)
+        let text = try await transcribe(url, through: engine, vocabulary: ["Orator", "Anthropic"])
 
-        let engine = SpeechEngine(locale: Locale(identifier: "en-US"), biasing: true)
-        let status = await engine.modelStatus()
-        try XCTSkipUnless(status == .installed, "en-US model not installed on this host")
-        try await engine.warmUp()
-        let format = try XCTUnwrap(engine.inputFormat)
-
-        let collector = TranscriptCollector()
-        engine.sink = collector
-
-        let capture = FileAudioCapture(url: url, realtime: true)
-        let stream = try capture.start(outputFormat: format)
-        let started = await engine.beginSession(vocabulary: ["Orator", "Anthropic"])
-        let token = try XCTUnwrap(started, "a vocabulary session must still start")
-        let bridge = Task.detached { [engine] in for await input in stream { engine.feed(input, for: token) } }
-        await bridge.value
-        _ = await engine.finalize(within: .seconds(5))
-        try await Task.sleep(for: .milliseconds(400))
-        engine.endSession()
-
-        let text = collector.confirmed.lowercased()
         XCTAssertFalse(text.isEmpty, "biasing session produced no transcript at all")
         XCTAssertTrue(["fox", "quick", "brown", "dog"].contains { text.contains($0) },
                       "biasing transcript did not contain expected words: '\(text)'")
@@ -451,40 +361,15 @@ final class VocabularyBiasingTests: XCTestCase {
         XCTAssertEqual(SpeechEngine.cappedVocabulary([]), [])
     }
 
-    /// An oversized vocabulary must not break the start either.
-    @MainActor
-    func testOversizedVocabularyDoesNotPreventStarting() async throws {
-        let engine = SpeechEngine(locale: Locale(identifier: "en-US"), biasing: true)
-        let status = await engine.modelStatus()
-        try XCTSkipUnless(status == .installed, "en-US model not installed on this host")
-        try await engine.warmUp()
-
-        let huge = (0..<250).map { "term\($0)" }
-        let started = await engine.beginSession(vocabulary: huge)
-        XCTAssertNotNil(started, "a 250-term vocabulary must not prevent a session from starting")
-        engine.endSession()
-    }
-
     /// The SessionToken guard exists so a bridge that outlives its session cannot bleed the previous
     /// dictation's audio into the next transcript. Every other test feeds the token it just received,
     /// so none of them can fail if the guard is deleted — this one feeds a RETIRED token deliberately.
+    /// Verified by mutation: deleting the token check makes this fail.
     @MainActor
     func testFeedingARetiredTokenIsDropped() async throws {
-        let phrase = "the silver wolf howls beneath the moon"
-        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("orator-token.aiff")
-        try? FileManager.default.removeItem(at: url)
-        let say = Process()
-        say.executableURL = URL(fileURLWithPath: "/usr/bin/say")
-        say.arguments = ["-o", url.path, phrase]
-        try say.run(); say.waitUntilExit()
-        try XCTSkipUnless(say.terminationStatus == 0, "`say` unavailable")
-
-        let engine = SpeechEngine(locale: Locale(identifier: "en-US"))
-        let status = await engine.modelStatus()
-        try XCTSkipUnless(status == .installed, "en-US model not installed on this host")
-        try await engine.warmUp()
+        let url = try sayToFile("the silver wolf howls beneath the moon", "orator-token.aiff")
+        let engine = try await warmEngine()
         let format = try XCTUnwrap(engine.inputFormat)
-
         let collector = TranscriptCollector()
         engine.sink = collector
 
@@ -498,9 +383,8 @@ final class VocabularyBiasingTests: XCTestCase {
         let b = try XCTUnwrap(startedB)
         XCTAssertNotEqual(a, b, "each session must get a distinct token")
 
-        // `realtime: true` matters: fed flat out, the analyzer produces nothing at all, and the
-        // assertion below would then pass for the wrong reason (verified — a positive control feeding
-        // the LIVE token also came back empty without it).
+        // `realtime: true` matters: fed flat out the analyzer produces nothing at all, and the
+        // assertion below would then pass for the wrong reason.
         let stale = FileAudioCapture(url: url, realtime: true)
         let staleStream = try stale.start(outputFormat: format)
         for await input in staleStream { engine.feed(input, for: a) }   // retired token

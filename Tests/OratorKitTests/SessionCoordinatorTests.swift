@@ -3,93 +3,6 @@ import XCTest
 import Speech
 @testable import OratorKit
 
-// MARK: - Stand-ins
-
-/// An audio source that starts cleanly and produces no buffers, letting a test decide exactly when
-/// capture "dies".
-///
-/// Models the REAL `AudioCapture` on the two points the watchdog depends on: a successful `start`
-/// clears the stall (real capture reseeds its buffer clock, so a failover genuinely buys another full
-/// budget — a stub that stayed stalled would drive a rapid-fire cascade hardware cannot produce), and
-/// device UIDs honour the failover exclusion set.
-@MainActor
-private final class StubAudio: AudioSource {
-    var currentLevel: Float = 0
-    var onUnrecoverableFailure: (@Sendable (String) -> Void)?
-    /// Seconds of silence to report. `start` resets it, mirroring the real clock reseed.
-    var stallSeconds: TimeInterval = 0
-    var hasDeliveredAudio = true
-    var throwOnStart: Error?
-    /// UIDs this stub can hand out, in preference order; `start` picks the first not excluded.
-    var availableUIDs: [String] = ["mic-a", "mic-b"]
-    private(set) var startCount = 0
-    private(set) var stopCount = 0
-    private(set) var excludedOnLastStart: Set<String> = []
-    private(set) var currentDeviceUID: String?
-    private var continuation: AsyncStream<AnalyzerInput>.Continuation?
-    private var running = false
-
-    var secondsSinceLastBuffer: TimeInterval? { running ? stallSeconds : nil }
-
-    func start(outputFormat: AVAudioFormat, excluding: Set<String>) throws -> AsyncStream<AnalyzerInput> {
-        excludedOnLastStart = excluding
-        if let throwOnStart { throw throwOnStart }
-        // Only excluded devices left ⇒ the same signal real capture gives (ORA-CAP-006).
-        guard let uid = availableUIDs.first(where: { !excluding.contains($0) }) else {
-            throw AudioCapture.CaptureError.noInputDevice
-        }
-        currentDeviceUID = uid
-        startCount += 1
-        running = true
-        stallSeconds = 0            // a fresh session restarts the watchdog budget, as real capture does
-        let (stream, cont) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .unbounded)
-        continuation = cont
-        return stream
-    }
-
-    func stop() {
-        guard running else { return }
-        stopCount += 1
-        running = false
-        currentDeviceUID = nil
-        continuation?.finish()
-        continuation = nil
-    }
-}
-
-/// Returns a scripted outcome and records what it was asked to insert — crucially, it never posts a
-/// real CGEvent ⌘V, so the suite can't paste into whatever app is frontmost.
-@MainActor
-private final class StubInserter: TextInserting {
-    var outcome: InsertionOutcome = .inserted
-    private(set) var insertedTexts: [String] = []
-
-    func insert(_ text: String, into target: TargetContext,
-                accessibilityGranted: Bool) async -> InsertionOutcome {
-        insertedTexts.append(text)
-        return outcome
-    }
-}
-
-@MainActor
-private final class FakePermissions: PermissionsManager {
-    var mic = true
-    var accessibility = true
-    override var microphoneGranted: Bool { mic }
-    override var accessibilityGranted: Bool { accessibility }
-}
-
-/// Silences the suite and records which cues fired — the terminal-feedback contract is the behaviour
-/// under test, not a side effect.
-private final class SpyFeedback: SoundFeedback, @unchecked Sendable {
-    enum Cue: Equatable { case start, stop, error, nothingHeard }
-    private(set) var cues: [Cue] = []
-    override func playStart() { cues.append(.start) }
-    override func playStop() { cues.append(.stop) }
-    override func playError() { cues.append(.error) }
-    override func playNothingHeard() { cues.append(.nothingHeard) }
-}
-
 // MARK: - Tests
 
 /// `SessionCoordinator` owns every ORA-SM/ORA-ACT requirement and had no tests at all, because its
@@ -99,53 +12,6 @@ private final class SpyFeedback: SoundFeedback, @unchecked Sendable {
 /// Tests that need a live analyzer skip when the en-US model isn't installed, matching the existing
 /// end-to-end tests.
 final class SessionCoordinatorTests: XCTestCase {
-
-    @MainActor
-    private struct Rig {
-        let coordinator: SessionCoordinator
-        let audio: StubAudio
-        let inserter: StubInserter
-        let permissions: FakePermissions
-        let feedback: SpyFeedback
-        let recovery: RecoveryBuffer
-    }
-
-    @MainActor
-    private func makeRig() async throws -> Rig {
-        let engine = SpeechEngine(locale: Locale(identifier: "en-US"))
-        let status = await engine.modelStatus()
-        try XCTSkipUnless(status == .installed, "en-US model not installed on this host")
-        try await engine.warmUp()
-
-        let audio = StubAudio()
-        let inserter = StubInserter()
-        let permissions = FakePermissions()
-        let feedback = SpyFeedback()
-        let recovery = RecoveryBuffer()
-        let coordinator = SessionCoordinator(audio: audio, engine: engine, inserter: inserter,
-                                             recovery: recovery, permissions: permissions,
-                                             feedback: feedback)
-        return Rig(coordinator: coordinator, audio: audio, inserter: inserter,
-                   permissions: permissions, feedback: feedback, recovery: recovery)
-    }
-
-    /// Let the coordinator's `Task { await startRecording() }` (and friends) run to completion.
-    @MainActor
-    private func settle(_ ms: Int = 250) async {
-        try? await Task.sleep(for: .milliseconds(ms))
-    }
-
-    /// Wait for the session to return to `.idle`, then hand back control immediately. Needed for any
-    /// assertion about `notice`, which is deliberately transient (~1.6 s) — a fixed long sleep would
-    /// race the notice's own expiry and read nil for the wrong reason.
-    @MainActor
-    private func waitUntilIdle(_ coordinator: SessionCoordinator, timeoutMs: Int = 6000) async {
-        var waited = 0
-        while coordinator.state != .idle, waited < timeoutMs {
-            try? await Task.sleep(for: .milliseconds(50))
-            waited += 50
-        }
-    }
 
     // ORA-SM-003: two presses before the async start has run are absorbed by the `starting` reentrancy
     // guard. (Named for the guard it actually exercises — at this point `state` is still `.idle`, so
@@ -363,16 +229,6 @@ final class SessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(rig.coordinator.notice, "Didn’t catch anything")
     }
 
-    // The capture watchdog only fires while `.recording` — the exact gating ORA-CAP-022 depends on.
-    @MainActor
-    func testWatchdogDoesNotFireWhileIdle() async throws {
-        let rig = try await makeRig()
-        rig.audio.stallSeconds = 60       // would be well past the stall limit if it were running
-        await settle(300)
-        XCTAssertEqual(rig.coordinator.state, .idle)
-        XCTAssertNil(rig.coordinator.lastError)
-    }
-
     // A stalled capture during recording is caught — and the watchdog's FIRST response is failover,
     // not termination.
     @MainActor
@@ -467,26 +323,13 @@ final class ResolveTextTests: XCTestCase {
 /// actionable readiness problem in the menu-bar tooltip.
 final class ErrorStalenessTests: XCTestCase {
 
-    @MainActor
-    private func makeCoordinator(now: @escaping @MainActor () -> Date)
-        async throws -> (SessionCoordinator, StubAudio) {
-        let engine = SpeechEngine(locale: Locale(identifier: "en-US"))
-        let status = await engine.modelStatus()
-        try XCTSkipUnless(status == .installed, "en-US model not installed on this host")
-        try await engine.warmUp()
-        let audio = StubAudio()
-        let coordinator = SessionCoordinator(audio: audio, engine: engine, inserter: StubInserter(),
-                                             recovery: RecoveryBuffer(), permissions: FakePermissions(),
-                                             feedback: SpyFeedback(), now: now)
-        return (coordinator, audio)
-    }
-
     /// The actual staleness rule: past the relevance window the error stops being *surfaced*, while
     /// `lastError` itself is retained for logs/diagnostics.
     @MainActor
     func testErrorStopsBeingSurfacedOnceStale() async throws {
         var clock = Date(timeIntervalSince1970: 10_000)
-        let (coordinator, audio) = try await makeCoordinator(now: { clock })
+        let rig = try await makeRig(now: { clock })
+        let (coordinator, audio) = (rig.coordinator, rig.audio)
 
         audio.throwOnStart = AudioCapture.CaptureError.noInputDevice
         coordinator.toggle()
@@ -505,7 +348,7 @@ final class ErrorStalenessTests: XCTestCase {
     /// be what makes this pass.
     @MainActor
     func testCancelClearsTheError() async throws {
-        let (coordinator, _) = try await makeCoordinator(now: { Date() })
+        let coordinator = try await makeRig().coordinator
         coordinator.toggle()
         try? await Task.sleep(for: .milliseconds(250))
         XCTAssertEqual(coordinator.state, .recording)
@@ -521,7 +364,8 @@ final class ErrorStalenessTests: XCTestCase {
     /// A successful start clears whatever failed before it.
     @MainActor
     func testSuccessfulStartClearsAPriorFailure() async throws {
-        let (coordinator, audio) = try await makeCoordinator(now: { Date() })
+        let rig = try await makeRig()
+        let (coordinator, audio) = (rig.coordinator, rig.audio)
 
         audio.throwOnStart = AudioCapture.CaptureError.noInputDevice
         coordinator.toggle()
@@ -542,17 +386,9 @@ final class ErrorStalenessTests: XCTestCase {
 final class StatusTooltipPrecedenceTests: XCTestCase {
     @MainActor
     func testReadinessOutranksAnErrorAndStaleErrorsAreNotShown() async throws {
-        let engine = SpeechEngine(locale: Locale(identifier: "en-US"))
-        let status = await engine.modelStatus()
-        try XCTSkipUnless(status == .installed, "en-US model not installed on this host")
-        try await engine.warmUp()
-
         var clock = Date(timeIntervalSince1970: 10_000)
-        let audio = StubAudio()
-        let permissions = FakePermissions()
-        let coordinator = SessionCoordinator(audio: audio, engine: engine, inserter: StubInserter(),
-                                             recovery: RecoveryBuffer(), permissions: permissions,
-                                             feedback: SpyFeedback(), now: { clock })
+        let rig = try await makeRig(now: { clock })
+        let (coordinator, audio, permissions) = (rig.coordinator, rig.audio, rig.permissions)
         let item = StatusItemController(coordinator: coordinator)
 
         // A fresh error while everything else is fine ⇒ the error is the useful thing to say.

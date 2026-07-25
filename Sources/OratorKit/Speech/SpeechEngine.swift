@@ -430,27 +430,29 @@ public final class SpeechEngine {
     /// Used after a normal stop (post-drain), on a finalize timeout, and on cancel (ORA-SM-012).
     /// Nothing from this session can leak into the next: the results task is cancelled and the
     /// analyzer is finished. Also queues the next spare so the following start is instant.
-    public func endSession() {
+    public func endSession() { teardown(queueingSpare: true) }
+
+    /// Tear down the active session without queueing a spare (used internally: cancel, rewarm,
+    /// shutdown, and the defensive call at the top of `beginSession`).
+    private func teardownActive() { teardown(queueingSpare: false) }
+
+    /// The single teardown. Both callers cancel the results task, finish the input, and finish the
+    /// old analyzer; the ONLY difference is whether a fresh spare is queued afterwards.
+    ///
+    /// Note the ordering, which is load-bearing on the `endSession` path: the old analyzer is fully
+    /// finished (bounded, so a wedged one cannot block forever) BEFORE the next spare is prepared, so
+    /// teardown and fresh setup never run against the speech daemon concurrently — that concurrency is
+    /// what let rapid-fire dictation wedge it. The insert step that follows usually covers the wait,
+    /// so the spare is ready by the next start.
+    private func teardown(queueingSpare: Bool) {
         resultsTask?.cancel(); resultsTask = nil
         finishActiveInput()
         let old = analyzer
         analyzer = nil
-        // Serialize daemon work so rapid-fire dictation can't wedge it: fully finish the OLD analyzer
-        // (bounded, so a wedged one can't block forever) BEFORE preparing the next spare — never run
-        // teardown and fresh setup concurrently. The insert step that follows usually covers this, so
-        // the spare is ready by the next start.
         Task { [weak self] in
             if let old { await Self.finishBounded(old) }
-            self?.ensureSpare()
+            if queueingSpare { self?.ensureSpare() }
         }
-    }
-
-    /// Tear down the active session's objects without queueing a spare (used internally). Finishes the
-    /// old analyzer fire-and-forget (callers here are one-off: cancel/rewarm/shutdown/defensive).
-    private func teardownActive() {
-        resultsTask?.cancel(); resultsTask = nil
-        finishActiveInput()
-        if let analyzer { self.analyzer = nil; Task { await Self.finishBounded(analyzer) } }
     }
 
     /// Finish and clear the live input under the lock, so a bridge task still yielding on another

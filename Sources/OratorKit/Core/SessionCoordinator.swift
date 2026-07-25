@@ -120,7 +120,7 @@ public final class SessionCoordinator: SpeechResultSink {
         Log.session.error("Capture failure: \(reason)")
         if attemptFailover() { return }
         setError(reason)
-        Task { await self.finishAfterCaptureLoss(reason: reason) }
+        Task { await self.finish(lossReason: reason) }
     }
 
     /// Move the live dictation onto whatever microphone is usable now, keeping the SAME analyzer
@@ -160,33 +160,6 @@ public final class SessionCoordinator: SpeechResultSink {
         // ended" — the exact signal failover exists to avoid. A working failover should be seamless.
         Log.session.notice("Failed over to another microphone; session continues")
         return true
-    }
-
-    /// No microphone left: end the dictation the same way a deliberate stop does. Previously this
-    /// dumped the confirmed text straight into the recovery menu, which threw away a perfectly good
-    /// paste into a target that was still focused — the same mistake the finalization-timeout path
-    /// used to make. Insertion re-verifies the frontmost app (ORA-INS-002), so recovery stays the
-    /// fallback rather than the default.
-    private func finishAfterCaptureLoss(reason: String) async {
-        guard state == .recording else { return }
-        state = .finalizing
-        teardownCapture()   // discard, not drain: the device is gone, there is nothing left to arrive
-
-        let finished = await engine.finalize(within: finalizationCap)
-        await drainConfirmed(upTo: .milliseconds(250))
-
-        // Tail read AFTER the drain — see `resolveText`.
-        let text = TranscriptCleaner.clean(Self.resolveText(confirmed: confirmedText,
-                                                            tail: volatilePreview,
-                                                            finished: finished))
-        volatilePreview = ""
-        engine.endSession()
-
-        state = .inserting
-        await insert(text, timedOut: !finished, lossReason: reason)
-        state = .idle
-        startInstant = nil
-        sessionToken = nil
     }
 
     /// Abort without finalizing — for a session that never had a transcriber attached, so there is
@@ -291,7 +264,7 @@ public final class SessionCoordinator: SpeechResultSink {
             starting = true                    // synchronous guard before the async start
             Task { await startRecording() }
         case .recording:
-            Task { await stopAndInsert() }
+            Task { await finish() }
         case .finalizing, .inserting:
             // Busy guard (ORA-SM-003): ignore.
             Log.session.debug("Hotkey ignored: busy (\(self.state.rawValue))")
@@ -372,7 +345,7 @@ public final class SessionCoordinator: SpeechResultSink {
         feedback.playStart()                                      // non-blocking cue (overlapped)
         let token = await engine.beginSession(vocabulary: Settings.shared.vocabulary)  // set vocab before feeding
 
-        // `beginSession` is a suspension point: a second hotkey press during it runs stopAndInsert →
+        // `beginSession` is a suspension point: a second hotkey press during it runs finish() →
         // teardownCapture concurrently. If we resumed here on a torn-down session we'd wire an orphan
         // bridge/tick that feeds audio into the engine AFTER endSession (duplicate/garbled text) and
         // ticks past teardown. Bail if the session is no longer recording (ORA-SM-014).
@@ -422,11 +395,26 @@ public final class SessionCoordinator: SpeechResultSink {
         }
     }
 
-    private func stopAndInsert() async {
+    /// The ONE terminal path: finalize whatever was said and place it.
+    ///
+    /// Both ways a dictation ends come through here — the user stopping it, and capture dying with no
+    /// microphone left to fail over to. They previously existed as two copies of the same nine steps,
+    /// and the copies drifted: the capture-loss path dumped confirmed text straight into the recovery
+    /// menu, throwing away a perfectly good paste into a target that was still focused, which is the
+    /// exact mistake the finalization-timeout path had already made once. One definition, one place to
+    /// change the stop sequence.
+    ///
+    /// `lossReason` is the only real difference in behaviour: it selects a discard teardown (the
+    /// device is gone, so there is nothing left to drain) and is surfaced to the user at the end.
+    private func finish(lossReason: String? = nil) async {
         guard state == .recording else { return }
         let stopped = ContinuousClock.now
         state = .finalizing
-        await teardownCaptureDraining()   // graceful stop: DRAIN trailing buffers (don't drop them)
+        if lossReason != nil {
+            teardownCapture()             // discard: the device is gone, nothing more will arrive
+        } else {
+            await teardownCaptureDraining()   // graceful stop: DRAIN trailing buffers (don't drop them)
+        }
 
         let finished = await engine.finalize(within: finalizationCap)
         DebugLog.stage("stop→final", ms: (ContinuousClock.now - stopped).milliseconds)   // M3
@@ -435,6 +423,7 @@ public final class SessionCoordinator: SpeechResultSink {
         // by `speechDidConfirm` — this closes the drop-the-tail race. Bounded ≤ ~250 ms (inside M2).
         await drainConfirmed(upTo: .milliseconds(250))
 
+        // Tail read AFTER the drain — see `resolveText`.
         let finalText = TranscriptCleaner.clean(Self.resolveText(confirmed: confirmedText,
                                                                  tail: volatilePreview,
                                                                  finished: finished))
@@ -442,7 +431,7 @@ public final class SessionCoordinator: SpeechResultSink {
         engine.endSession()   // drop anything still unfinalized so it can't cross into next session
 
         state = .inserting
-        await insert(finalText, timedOut: !finished)
+        await insert(finalText, timedOut: !finished, lossReason: lossReason)
         DebugLog.stage("stop→inserted", ms: (ContinuousClock.now - stopped).milliseconds)   // M2
         state = .idle
         startInstant = nil
@@ -459,17 +448,14 @@ public final class SessionCoordinator: SpeechResultSink {
     /// `lossReason`, when set, means the dictation ended because capture died rather than because the
     /// user stopped it — the text still gets placed, but the user is told what happened to the mic.
     private func insert(_ text: String, timedOut: Bool, lossReason: String? = nil) async {
+        guard !text.isEmpty else { emptyResultFeedback(lossReason); return }
         guard let target else {
             // No target at all — the one case where text genuinely cannot be placed (M4).
-            if !text.isEmpty {
-                recovery.add(Self.standalone(text), reason: timedOut ? .finalizationTimeout : .noTarget)
-                deferredFeedback(timedOut ? .finalizationTimeout : .noTarget)
-            } else {
-                emptyResultFeedback(lossReason)
-            }
+            let reason: RecoveryReason = timedOut ? .finalizationTimeout : .noTarget
+            recovery.add(Self.standalone(text), reason: reason)
+            deferredFeedback(reason)
             return
         }
-        guard !text.isEmpty else { emptyResultFeedback(lossReason); return }
 
         let outcome = await inserter.insert(text, into: target,
                                             accessibilityGranted: permissions.accessibilityGranted)
@@ -509,8 +495,9 @@ public final class SessionCoordinator: SpeechResultSink {
     /// continue — so it always gets a capital, unlike text pasted into a field (see `SentenceContext`).
     private static func standalone(_ text: String) -> String { TranscriptCleaner.capitalized(text) }
 
-    /// Join confirmed text with a trailing volatile fragment, inserting a separating space only when
-    /// the boundary needs one — matching how `speechDidConfirm` accumulates.
+    /// Join two fragments, inserting a separating space only when the boundary needs one. The single
+    /// definition of that rule: `speechDidConfirm` accumulates confirmed segments through it, and
+    /// `resolveText` appends the volatile tail through it, so the two cannot drift.
     private static func joined(_ head: String, _ tail: String) -> String {
         guard !tail.isEmpty else { return head }
         guard !head.isEmpty else { return tail }
@@ -553,13 +540,13 @@ public final class SessionCoordinator: SpeechResultSink {
                 self.audioLevel = self.audio.currentLevel
                 self.peakLevel = max(self.peakLevel, self.audioLevel)
                 if self.elapsed >= self.maxDuration {
-                    // Hand off to a FRESH task and leave the loop. Calling stopAndInsert() inline ran
+                    // Hand off to a FRESH task and leave the loop. Calling finish() inline ran
                     // the whole stop path inside tickTask — which stopTimersAndTaps cancels — so every
                     // `try? await Task.sleep` on that path threw CancellationError immediately and was
                     // swallowed: drainConfirmed collapsed to zero-elapsed iterations (dropping the late
                     // finals it exists to collect) and the terminal settle delay was skipped. This keeps
                     // auto-stop byte-identical to the manual stop path, as E14 claims (ORA-SM-010).
-                    Task { @MainActor [weak self] in await self?.stopAndInsert() }
+                    Task { @MainActor [weak self] in await self?.finish() }
                     break
                 }
                 self.checkCaptureAlive()
@@ -658,11 +645,7 @@ public final class SessionCoordinator: SpeechResultSink {
 
     public func speechDidConfirm(_ text: String) {
         guard state == .recording || state == .finalizing else { return }
-        if let last = confirmedText.last, !last.isWhitespace,
-           let first = text.first, !first.isWhitespace {
-            confirmedText += " "
-        }
-        confirmedText += text
+        confirmedText = Self.joined(confirmedText, text)
         volatilePreview = ""
     }
 

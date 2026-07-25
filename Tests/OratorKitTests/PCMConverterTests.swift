@@ -107,20 +107,9 @@ final class PCMConverterDownmixTests: XCTestCase {
         return buf
     }
 
-    /// THE regression guard: the exact format a Yeti X / Brio 505 delivers.
-    func testDeinterleavedStereoFloat32DownmixesToAudibleMono() throws {
-        let out = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000,
-                                              channels: 1, interleaved: false))
-        let input = try stereoBuffer(commonFormat: .pcmFormatFloat32, interleaved: false)
-        XCTAssertGreaterThan(PCMConverter.rms(input), 0.1, "test fixture must contain real signal")
-
-        let converted = try XCTUnwrap(PCMConverter(outputFormat: out).convert(input),
-                                      "conversion returned nil")
-        XCTAssertGreaterThan(PCMConverter.rms(converted), 0.1,
-                             "stereo downmix produced SILENCE — the recognizer would receive nothing")
-    }
-
-    /// Every stereo shape a capture device might hand us must survive the downmix.
+    /// Every stereo shape a capture device might hand us must survive the downmix. The
+    /// Float32-deinterleaved case is THE regression guard: it is exactly what a Yeti X / Brio 505
+    /// delivers, and it used to convert to silence.
     func testAllStereoLayoutsDownmixToAudibleMono() throws {
         let out = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000,
                                               channels: 1, interleaved: false))
@@ -129,6 +118,7 @@ final class PCMConverterDownmixTests: XCTestCase {
                                     (.pcmFormatInt16, false, "Int16 deinterleaved"),
                                     (.pcmFormatInt16, true, "Int16 interleaved")] {
             let input = try stereoBuffer(commonFormat: fmt, interleaved: inter)
+            XCTAssertGreaterThan(PCMConverter.rms(input), 0.1, "\(label): fixture must contain real signal")
             let converted = try XCTUnwrap(PCMConverter(outputFormat: out).convert(input), "\(label): nil")
             XCTAssertGreaterThan(PCMConverter.rms(converted), 0.1, "\(label) downmixed to silence")
         }
