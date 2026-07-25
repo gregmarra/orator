@@ -34,7 +34,11 @@ enum SentenceContext {
         guard let last = trimmed.last else { return true }   // nothing but whitespace ⇒ empty field
         if terminators.contains(last) { return true }
         if continuers.contains(last) { return false }
-        return false                                         // a word character ⇒ mid-sentence
+        // A sentence is only in progress if the caret actually follows PROSE. Anything else — a shell
+        // prompt ">", a "$" or "#", a box-drawing character — is interface chrome, and text typed
+        // after it begins a sentence. Treating every unrecognized character as mid-sentence
+        // suppressed the capital at a terminal prompt.
+        return !(last.isLetter || last.isNumber)
     }
 
     /// A privacy-safe description of the character the decision turned on: its CLASS only, never the

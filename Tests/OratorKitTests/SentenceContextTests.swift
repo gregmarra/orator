@@ -50,6 +50,23 @@ final class SentenceContextTests: XCTestCase {
         XCTAssertFalse(SentenceContext.startsSentence(after: "(an aside),"))
     }
 
+    /// Interface chrome is not prose. A shell prompt, a box-drawing character or a "$" means the
+    /// caret sits at the start of an input, not in the middle of a sentence — this is what suppressed
+    /// the capital after a terminal's ">" prompt.
+    func testChromeCharactersStartASentence() {
+        for preceding in ["> ", ">", "$ ", "# ", "% ", "│ ", "❯ ", "|"] {
+            XCTAssertTrue(SentenceContext.startsSentence(after: preceding),
+                          "'\(preceding)' is chrome, so what follows starts a sentence")
+        }
+    }
+
+    /// …but real prose still continues, which is the distinction that matters.
+    func testProseStillContinues() {
+        XCTAssertFalse(SentenceContext.startsSentence(after: "the quick brown"))
+        XCTAssertFalse(SentenceContext.startsSentence(after: "value 42"))
+        XCTAssertFalse(SentenceContext.startsSentence(after: "hello, "))
+    }
+
     // MARK: Leading space (ORA-INS-008)
 
     /// An unknown context must fabricate nothing: no space, and the safe capital. This is the state
