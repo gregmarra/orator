@@ -26,31 +26,20 @@ public class SoundFeedback {
 
     private var enabled: Bool { Settings.shared.soundEnabled }
 
-    /// Play the start cue. Non-blocking: plays concurrently with capture start, never delaying the
-    /// hotkey→capturing budget (M1 MUST > FBK-001 SHOULD). No-op when sound is disabled.
-    public func playStart() {
-        guard enabled, let sound = startSound else { return }
+    /// Play a cue, restarting it if it's already sounding so rapid dictations don't swallow their own
+    /// feedback. Non-blocking: a cue never delays the hotkey→capturing budget (M1 MUST > FBK-001
+    /// SHOULD). No-op when the user has sound off.
+    private func play(_ sound: NSSound?) {
+        guard enabled, let sound else { return }
         sound.stop()
         sound.play()
     }
 
-    public func playStop() {
-        guard enabled else { return }
-        stopSound?.stop()
-        stopSound?.play()
-    }
-
+    public func playStart() { play(startSound) }
+    public func playStop() { play(stopSound) }
     /// "I heard nothing" — the start cue an octave down, deliberately not the error sound.
-    public func playNothingHeard() {
-        guard enabled else { return }
-        nothingHeardSound?.stop()
-        nothingHeardSound?.play()
-    }
-
-    public func playError() {
-        guard enabled else { return }
-        errorSound?.play()
-    }
+    public func playNothingHeard() { play(nothingHeardSound) }
+    public func playError() { play(errorSound) }
 
     // MARK: Deriving the family from one system sound
 
@@ -63,7 +52,7 @@ public class SoundFeedback {
     /// Deliberately NOT `AVAudioEngine`: starting one corrupts the Swift main-actor executor identity
     /// process-wide on this toolchain, which crashes SwiftUI (see the note in `AudioCapture`). Nowhere
     /// near worth it for a cue sound. `AVAudioFile` alone is fine — it is the engine that is poison.
-    private static func tink(pitch: Double, gain: Float = 0.9) -> NSSound? {
+    private static func tink(pitch: Double) -> NSSound? {
         let url = URL(fileURLWithPath: "/System/Library/Sounds/Tink.aiff")
         guard let file = try? AVAudioFile(forReading: url) else { return nil }
         let format = file.processingFormat
@@ -81,7 +70,7 @@ public class SoundFeedback {
             let i = Int(x)
             guard i + 1 < source.count else { break }
             let fraction = Float(x - Double(i))    // linear interpolation between neighbouring samples
-            out[j] = (source[i] * (1 - fraction) + source[i + 1] * fraction) * gain
+            out[j] = (source[i] * (1 - fraction) + source[i + 1] * fraction) * 0.9   // a touch under the source
         }
         return NSSound(data: wav(out, sampleRate: format.sampleRate))
     }
