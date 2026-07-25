@@ -52,6 +52,13 @@ final class SentenceContextTests: XCTestCase {
 
     // MARK: Leading space (ORA-INS-008)
 
+    /// An unknown context must fabricate nothing: no space, and the safe capital. This is the state
+    /// a terminal lands in, where the accessibility buffer is scrollback rather than the typed line.
+    func testUnknownContextAddsNoSpaceAndCapitalizes() {
+        XCTAssertFalse(SentenceContext.needsLeadingSpace(after: nil))
+        XCTAssertTrue(SentenceContext.startsSentence(after: nil))
+    }
+
     func testLeadingSpaceOnlyAfterANonSpaceCharacter() {
         XCTAssertTrue(SentenceContext.needsLeadingSpace(after: "hello"))
         XCTAssertTrue(SentenceContext.needsLeadingSpace(after: "Done."))
