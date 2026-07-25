@@ -37,6 +37,21 @@ enum SentenceContext {
         return false                                         // a word character ⇒ mid-sentence
     }
 
+    /// A privacy-safe description of the character the decision turned on: its CLASS only, never the
+    /// character itself, so dictated content cannot leak into the log (ORA-PRIV-002).
+    static func describeLastCharacter(of preceding: String?) -> String {
+        guard let preceding else { return "unreadable" }
+        if let last = preceding.last, last.isNewline { return "newline" }
+        var t = Substring(preceding)
+        while let last = t.last, last.isWhitespace { t = t.dropLast() }
+        while let last = t.last, closers.contains(last) { t = t.dropLast() }
+        guard let last = t.last else { return "empty" }
+        if terminators.contains(last) { return "terminator" }
+        if continuers.contains(last) { return "clause-punctuation" }
+        if last.isLetter || last.isNumber { return "word" }
+        return "other"
+    }
+
     /// Does the insertion need a separating space, because the caret sits immediately after a
     /// non-whitespace character (ORA-INS-008)? Back-to-back dictations into the same field would
     /// otherwise run together.

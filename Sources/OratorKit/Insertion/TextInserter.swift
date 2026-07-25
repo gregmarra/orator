@@ -71,27 +71,82 @@ public final class TextInserter {
         //    unconditionally upstream is what made a continuation after "hello," come back as "Hello".
         let delay = target.bundleID.flatMap { Self.settleDelays[$0] }
         let preceding = precedingText(element)
-        var toInsert = SentenceContext.startsSentence(after: preceding)
-            ? TranscriptCleaner.capitalized(text) : text
+        let startsSentence = SentenceContext.startsSentence(after: preceding)
+        // Diagnostic for "why was this capitalized?". Logs only the CLASS of the deciding character,
+        // never the text itself — dictated content must never reach the unified log (ORA-PRIV-002).
+        Log.insert.notice("""
+            Caret context: readable=\(preceding != nil, privacy: .public) \
+            lastChar=\(SentenceContext.describeLastCharacter(of: preceding), privacy: .public) \
+            startsSentence=\(startsSentence, privacy: .public) \
+            app=\(target.bundleID ?? "unknown", privacy: .public) \
+            \(self.describeAXCapabilities(element), privacy: .public)
+            """)
+        var toInsert = startsSentence ? TranscriptCleaner.capitalized(text) : text
         if SentenceContext.needsLeadingSpace(after: preceding) { toInsert = " " + toInsert }
         return await paste(toInsert, settle: delay, element: element)
     }
 
-    /// The field's text up to the caret, or nil when it isn't readable via AX — the safe default for
-    /// fields that don't expose these attributes, which callers treat as "standalone text".
+    /// Which text-bearing attributes the focused element actually exposes. Terminals and web views
+    /// vary wildly here, and "we cannot read the caret context" has several distinct causes that need
+    /// different fallbacks — this says which one we hit. Names and shapes only, never content.
+    private func describeAXCapabilities(_ element: AXUIElement) -> String {
+        func has(_ attr: String) -> Bool {
+            var value: CFTypeRef?
+            return AXUIElementCopyAttributeValue(element, attr as CFString, &value) == .success
+        }
+        let role = copyString(element, kAXRoleAttribute) ?? "?"
+        let valueLength = copyString(element, kAXValueAttribute)?.count
+        let caret = caretLocation(element)
+        let viaRange = caret.flatMap { $0 > 0 ? stringForRange(element, location: max(0, $0 - 8), length: min(8, $0)) : "" }
+        return "role=\(role) hasValue=\(valueLength != nil) hasRange=\(has(kAXSelectedTextRangeAttribute)) "
+             + "caret=\(caret.map(String.init) ?? "-") stringForRange=\(viaRange != nil ? "ok" : "unsupported")"
+    }
+
+    /// How much text before the caret we ask for. We only need the last non-whitespace character, but
+    /// a small window absorbs trailing spaces and newlines.
+    private static let contextWindow = 64
+
+    /// The text immediately before the caret, or nil when the field won't tell us — which callers
+    /// treat as "standalone text" and capitalize.
+    ///
+    /// Asks for a RANGE rather than the whole value. Many apps refuse `kAXValue` on a text area (it
+    /// can be enormous, and some deliberately withhold it) while still answering
+    /// `AXStringForRange` — WhatsApp is exactly this shape: `hasValue=false`, `hasRange=true`.
+    /// Reading the whole value therefore failed in apps where the context was perfectly obtainable,
+    /// and every dictation there got capitalized as a new sentence. Falls back to the full value for
+    /// fields that answer that instead.
     private func precedingText(_ element: AXUIElement) -> String? {
+        guard let caret = caretLocation(element) else { return copyString(element, kAXValueAttribute) }
+        guard caret > 0 else { return "" }                    // caret at the very start ⇒ empty context
+        let start = max(0, caret - Self.contextWindow)
+        if let window = stringForRange(element, location: start, length: caret - start) { return window }
+        // Parameterized read unsupported ⇒ fall back to slicing the full value, if we can get it.
         guard let text = copyString(element, kAXValueAttribute) else { return nil }
-        guard !text.isEmpty else { return "" }
+        let units = Array(text.utf16)                          // AX offsets are UTF-16
+        let end = min(caret, units.count)                      // clamp: a stale caret can outrun the value
+        return String(decoding: units[0..<end], as: UTF16.self)
+    }
+
+    /// Caret offset (UTF-16) within the focused element, if it reports one.
+    private func caretLocation(_ element: AXUIElement) -> Int? {
         var rangeRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
               let axRange = rangeRef, CFGetTypeID(axRange) == AXValueGetTypeID() else { return nil }
         var caret = CFRange()
         guard AXValueGetValue((axRange as! AXValue), .cfRange, &caret), caret.location >= 0 else { return nil }
-        // AX offsets are UTF-16; clamp because a stale caret can outrun the value we just read.
-        let units = Array(text.utf16)
-        let end = min(caret.location, units.count)
-        guard end >= 0 else { return nil }
-        return String(decoding: units[0..<end], as: UTF16.self)
+        return caret.location
+    }
+
+    /// `AXStringForRange` — the parameterized read that works where `kAXValue` is refused.
+    private func stringForRange(_ element: AXUIElement, location: Int, length: Int) -> String? {
+        guard length > 0 else { return "" }
+        var range = CFRange(location: location, length: length)
+        guard let parameter = AXValueCreate(.cfRange, &range) else { return nil }
+        var result: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+                element, kAXStringForRangeParameterizedAttribute as CFString, parameter, &result) == .success
+        else { return nil }
+        return result as? String
     }
 
     // MARK: Focused-field inspection
