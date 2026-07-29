@@ -353,7 +353,7 @@ final class ErrorStalenessTests: XCTestCase {
         try? await Task.sleep(for: .milliseconds(250))
         XCTAssertEqual(coordinator.state, .recording)
 
-        coordinator.reportVocabularyUnavailable()    // sets an error WITHOUT ending the session
+        coordinator.setError("something went wrong")   // sets an error WITHOUT ending the session
         XCTAssertNotNil(coordinator.recentError)
 
         coordinator.cancel()

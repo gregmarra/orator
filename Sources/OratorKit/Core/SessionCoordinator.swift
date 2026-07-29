@@ -181,15 +181,11 @@ public final class SessionCoordinator: SpeechResultSink {
         showNotice(reason)
     }
 
-    /// Surface that custom vocabulary can't take effect (the biasing model isn't available), so the
-    /// Settings pane isn't quietly advertising an inert feature. Dictation itself is unaffected, so
-    /// this is an error string for the menu tooltip only — no cue, no indicator interruption.
-    public func reportVocabularyUnavailable() {
-        setError("Custom vocabulary isn’t active — the dictation model couldn’t be installed.")
-    }
-
     /// Record a failure reason, timestamped so it can go stale (see `recentError`).
-    private func setError(_ reason: String) {
+    ///
+    /// `internal` rather than `private` only so tests can provoke an error mid-session without
+    /// ending it — every real caller is in this file.
+    func setError(_ reason: String) {
         lastError = reason
         lastErrorAt = now()
     }
@@ -343,7 +339,8 @@ public final class SessionCoordinator: SpeechResultSink {
         clearError()
         DebugLog.stage("start→capturing", ms: (ContinuousClock.now - began).milliseconds)   // M1 (ORA-PERF-004)
         feedback.playStart()                                      // non-blocking cue (overlapped)
-        let token = await engine.beginSession(vocabulary: Settings.shared.vocabulary)  // set vocab before feeding
+
+        let token = await engine.beginSession()
 
         // `beginSession` is a suspension point: a second hotkey press during it runs finish() →
         // teardownCapture concurrently. If we resumed here on a torn-down session we'd wire an orphan

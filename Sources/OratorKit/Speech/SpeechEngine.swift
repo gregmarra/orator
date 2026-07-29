@@ -44,15 +44,6 @@ private final class FinalizeRace: @unchecked Sendable {
     }
 }
 
-/// The shape both transcriber kinds' results share: `text` plus the `isFinal` that `SpeechModuleResult`
-/// provides. Lets one generic results task serve `SpeechTranscriber` and `DictationTranscriber`, whose
-/// `results` sequences are distinct opaque types.
-private protocol TranscriptResult: SpeechModuleResult {
-    var text: AttributedString { get }
-}
-extension SpeechTranscriber.Result: TranscriptResult {}
-extension DictationTranscriber.Result: TranscriptResult {}
-
 /// On-device streaming recognition (§8.4). Wraps the macOS-26 `SpeechAnalyzer` + `SpeechTranscriber`.
 ///
 /// The **model asset** is kept resident for the app lifetime (ORA-ASR-005) so no dictation pays a
@@ -85,7 +76,7 @@ public final class SpeechEngine {
     /// to `start(inputSequence:)` — moving the slow `prepareToAnalyze` OFF the hotkey path. Prepared
     /// at warm-up and re-prepared in the background after each dictation ends.
     private struct PreparedSession {
-        let transcriber: Transcriber
+        let transcriber: SpeechTranscriber
         let analyzer: SpeechAnalyzer
         let stream: AsyncStream<AnalyzerInput>
         let continuation: AsyncStream<AnalyzerInput>.Continuation
@@ -115,36 +106,22 @@ public final class SpeechEngine {
     /// Set by the coordinator before a session; results are delivered here in order.
     public weak var sink: SpeechResultSink?
 
-    /// Which transcriber kind the *next prepared spare* should use. Seeded from whether the user has a
-    /// custom vocabulary and re-set by every `beginSession`, so the pre-prepared spare is normally
-    /// already the right kind and the hotkey path never pays to build one inline.
-    private var biasingWanted: Bool
-
-    public init(locale: Locale, biasing: Bool = false) {
+    public init(locale: Locale) {
         self.locale = locale
-        self.biasingWanted = biasing
     }
 
     // MARK: Model asset lifecycle (ORA-ASR-006 / E3–E4)
 
-    /// The two transcriber kinds a session can run on. `SpeechTranscriber` is the default streaming
-    /// path; `DictationTranscriber` is the ONLY one that honours `AnalysisContext.contextualStrings`,
-    /// so custom-vocabulary biasing (ORA-VOC-001/002, M7) requires it. Both vend `SpeechModuleResult`s
-    /// carrying `text` + `isFinal`, so everything downstream is shared.
-    fileprivate enum Transcriber {
-        case speech(SpeechTranscriber)
-        case dictation(DictationTranscriber)
-
-        var module: any SpeechModule {
-            switch self {
-            case .speech(let t): return t
-            case .dictation(let t): return t
-            }
-        }
-        /// True for the kind that actually applies contextual strings.
-        var supportsBiasing: Bool { if case .dictation = self { return true }; return false }
-    }
-
+    /// Orator runs on `SpeechTranscriber` unconditionally — the newest, most accurate module.
+    ///
+    /// The alternative, `DictationTranscriber`, is the only module that honours
+    /// `AnalysisContext.contextualStrings`, so recognition biasing requires it. We deliberately don't
+    /// take that trade: Apple documents that DictationTranscriber "uses the same speech-to-text
+    /// machine learning models as system dictation features do", i.e. the older lineage, while
+    /// SpeechTranscriber is the model shipped for Notes/Voice Memos/Journal. Running the better model
+    /// unconditionally IS the product; a vocabulary feature that silently downgrades it is not worth
+    /// having. (Independent LibriSpeech numbers put the new module at 2.12%/4.56% WER against
+    /// 9.02%/16.25% for the legacy one — the gap is large and the biasing gain is not.)
     private func makeSpeechTranscriber() -> SpeechTranscriber {
         // Streaming preset with volatile results for the live preview (ORA-IND-010) and native
         // punctuation preserved (ORA-ASR-007). No etiquette/disfluency stripping (ORA-VOC-004).
@@ -152,19 +129,6 @@ public final class SpeechEngine {
                           transcriptionOptions: [],
                           reportingOptions: [.volatileResults],
                           attributeOptions: [])
-    }
-
-    private func makeDictationTranscriber() -> DictationTranscriber {
-        // Same streaming shape as above, on the biasing-capable module.
-        DictationTranscriber(locale: locale,
-                             contentHints: [],
-                             transcriptionOptions: [],
-                             reportingOptions: [.volatileResults],
-                             attributeOptions: [])
-    }
-
-    private func makeTranscriber(biasing: Bool) -> Transcriber {
-        biasing ? .dictation(makeDictationTranscriber()) : .speech(makeSpeechTranscriber())
     }
 
     /// All BCP-47 locale ids the transcriber supports on this device (read dynamically — the Settings
@@ -199,9 +163,7 @@ public final class SpeechEngine {
     /// Download + install the model, reporting progress (ORA-ASR-006). Retryable; a throw is an
     /// onboarding state, never fatal (E4).
     public func installModel(onProgress: @escaping @Sendable (Double) -> Void) async throws {
-        // Install the assets for BOTH transcriber kinds: a vocabulary user's sessions run on
-        // `DictationTranscriber`, and its asset is not implied by `SpeechTranscriber`'s.
-        let modules: [any SpeechModule] = [makeSpeechTranscriber(), makeDictationTranscriber()]
+        let modules: [any SpeechModule] = [makeSpeechTranscriber()]
         // Reserve the locale so the asset stays resident once installed (R2).
         _ = try? await AssetInventory.reserve(locale: locale)
         guard let request = try await AssetInventory.assetInstallationRequest(supporting: modules) else {
@@ -227,70 +189,27 @@ public final class SpeechEngine {
         // Reserve the locale so the weights stay in RAM independent of any analyzer's lifetime.
         _ = try? await AssetInventory.reserve(locale: locale)
 
-        // A format both transcriber kinds accept, so switching to the biasing-capable one mid-life
-        // never invalidates the format capture is already converting to. Falls back to the default
-        // path's own format if no shared one exists (the biasing session then can't prepare, and
-        // `makePreparedSession` degrades to `SpeechTranscriber`).
-        let modules: [any SpeechModule] = [makeSpeechTranscriber(), makeDictationTranscriber()]
-        if let shared = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: modules) {
-            self.inputFormat = shared
-        } else {
-            self.inputFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [makeSpeechTranscriber()])
-        }
+        self.inputFormat = await SpeechAnalyzer.bestAvailableAudioFormat(
+            compatibleWith: [makeSpeechTranscriber()])
         modelReady = true
-        spare = await makePreparedSession(biasing: biasingWanted)   // ready so the FIRST dictation starts instantly
+        spare = await makePreparedSession()   // ready so the FIRST dictation starts instantly
     }
 
     public var isWarm: Bool { modelReady && inputFormat != nil }
-
-    /// Whether the biasing-capable module's asset is present. `modelStatus()` deliberately answers for
-    /// `SpeechTranscriber` only — it gates *recording*, which must never be blocked by a vocabulary
-    /// feature — so this is the separate question "can custom vocabulary actually work right now?".
-    public func biasingAssetInstalled() async -> Bool {
-        await AssetInventory.status(forModules: [makeDictationTranscriber()]) == .installed
-    }
-
-    /// Fetch the biasing module's asset if the user has a vocabulary and it isn't installed.
-    ///
-    /// Without this the feature is dead on every EXISTING install: `installModel` covers both modules
-    /// but only runs when `modelStatus()` reports the *SpeechTranscriber* asset missing — which it
-    /// never is for someone already dictating. `makePreparedSession(biasing:)` would then fail to
-    /// prepare and silently fall back to unbiased recognition, forever, with only a log line.
-    /// Returns true when biasing is usable afterwards.
-    @discardableResult
-    public func ensureBiasingAsset() async -> Bool {
-        guard modelReady else { return false }
-        if await biasingAssetInstalled() { return true }
-        Log.speech.notice("Custom vocabulary set but the dictation asset is missing — installing")
-        do { try await installModel { _ in } }
-        catch {
-            Log.speech.error("Dictation asset install failed: \(error.localizedDescription)")
-            return false
-        }
-        let ok = await biasingAssetInstalled()
-        if ok { spare = nil; ensureSpare() }   // rebuild the spare now that the right kind can prepare
-        return ok
-    }
 
     // MARK: Per-session lifecycle (a fresh analyzer per dictation — clean boundaries)
 
     /// Build a fresh, fully-prepared session (the expensive `prepareToAnalyze` happens here, off the
     /// hotkey path). Returns nil if the model isn't ready.
-    private func makePreparedSession(biasing: Bool) async -> PreparedSession? {
+    private func makePreparedSession() async -> PreparedSession? {
         guard let format = inputFormat else { return nil }
-        if let session = await prepare(makeTranscriber(biasing: biasing), format: format) { return session }
-        // A biasing session that can't be prepared (its asset absent on this host, or no shared audio
-        // format) must NOT cost the user their dictation — fall back to the default transcriber and
-        // lose only the vocabulary bias.
-        guard biasing else { return nil }
-        Log.speech.error("Biasing transcriber unavailable — falling back to SpeechTranscriber (vocabulary bias lost)")
-        return await prepare(.speech(makeSpeechTranscriber()), format: format)
+        return await prepare(makeSpeechTranscriber(), format: format)
     }
 
-    private func prepare(_ transcriber: Transcriber, format: AVAudioFormat) async -> PreparedSession? {
+    private func prepare(_ transcriber: SpeechTranscriber, format: AVAudioFormat) async -> PreparedSession? {
         let (stream, cont) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .unbounded)
         let analyzer = SpeechAnalyzer(
-            modules: [transcriber.module],
+            modules: [transcriber],
             options: SpeechAnalyzer.Options(priority: .high, modelRetention: .processLifetime))
         do { try await analyzer.prepareToAnalyze(in: format) }
         catch { Log.speech.error("prepare spare failed: \(error.localizedDescription)"); return nil }
@@ -304,50 +223,37 @@ public final class SpeechEngine {
         preparingSpare = true
         Task { [weak self] in
             guard let self else { return }
-            let session = await self.makePreparedSession(biasing: self.biasingWanted)
+            let session = await self.makePreparedSession()
             self.spare = session
             self.preparingSpare = false
         }
     }
 
-    /// Start a dictation on a pre-prepared spare (instant): just apply vocabulary + `start`. Each
-    /// dictation gets its OWN analyzer/transcriber/stream/results task, so no state can leak or drop
-    /// across sessions (verified by `CrossSessionTests`).
+    /// Start a dictation on a pre-prepared spare (instant): just `start`. Each dictation gets its OWN
+    /// analyzer/transcriber/stream/results task, so no state can leak or drop across sessions
+    /// (verified by `CrossSessionTests`).
     /// Returns the token identifying the started session, or **nil** if the session could not be
     /// started (model not ready, no preparable analyzer, `start` threw). A nil return MUST be treated
     /// as a failed start: without it the caller would show a live indicator over a session that has no
     /// transcriber attached and silently discard every buffer (ORA-REL-001).
     @discardableResult
-    public func beginSession(vocabulary: [String]) async -> SessionToken? {
+    public func beginSession() async -> SessionToken? {
         guard modelReady else {
             Log.speech.error("beginSession: model not ready")
             return nil
         }
         teardownActive()   // defensive: never run two sessions on one analyzer
 
-        // Contextual biasing only takes effect on `DictationTranscriber`, so the vocabulary decides
-        // which kind this session (and the next prepared spare) uses.
-        let vocabulary = Self.cappedVocabulary(vocabulary)
-        let biasing = !vocabulary.isEmpty
-        biasingWanted = biasing
-
-        // Take the ready spare (the common, instant path); only build one inline if none is ready
-        // (e.g. very fast back-to-back dictations before the background prepare finished) or the ready
-        // one is the wrong kind because the vocabulary was added/cleared since it was prepared.
+        // Take the ready spare (the common, instant path); only build one inline if none is ready —
+        // e.g. very fast back-to-back dictations before the background prepare finished.
         let session: PreparedSession
-        if let s = spare, s.transcriber.supportsBiasing == biasing { session = s; spare = nil }
-        else if let s = await makePreparedSession(biasing: biasing) { spare = nil; session = s }
+        if let s = spare { session = s; spare = nil }
+        else if let s = await makePreparedSession() { session = s }
         else {
             Log.speech.error("beginSession: no analyzer session could be prepared")
             return nil
         }
 
-        if biasing {
-            let context = AnalysisContext()
-            context.contextualStrings = [.general: vocabulary]
-            do { try await session.analyzer.setContext(context) }
-            catch { Log.speech.error("setContext (vocabulary biasing) failed: \(error.localizedDescription)") }
-        }
         do { try await session.analyzer.start(inputSequence: session.stream) }
         catch {
             Log.speech.error("beginSession start failed: \(error.localizedDescription)")
@@ -361,25 +267,13 @@ public final class SpeechEngine {
         activeInput.withLock { $0 = ActiveInput(token: token, continuation: session.continuation) }
 
         // Per-session results task (ORA-CC-003). Ends when this session is torn down.
-        switch session.transcriber {
-        case .speech(let t): resultsTask = makeResultsTask(t.results)
-        case .dictation(let t): resultsTask = makeResultsTask(t.results)
-        }
+        resultsTask = makeResultsTask(session.transcriber.results)
         return token
     }
 
-    /// Contextual strings are capped by the recognizer; an oversized array can drop the WHOLE set
-    /// rather than the excess, so truncate loudly instead of silently losing every term.
-    static let maxContextualStrings = 100
-    static func cappedVocabulary(_ vocabulary: [String]) -> [String] {
-        guard vocabulary.count > maxContextualStrings else { return vocabulary }
-        Log.speech.notice("Vocabulary truncated to \(maxContextualStrings) terms (had \(vocabulary.count))")
-        return Array(vocabulary.prefix(maxContextualStrings))
-    }
-
-    /// The single ordered results consumer, generic over the two transcriber kinds' result sequences.
-    private func makeResultsTask<R: TranscriptResult>(
-        _ results: some AsyncSequence<R, any Error> & Sendable
+    /// The single ordered results consumer.
+    private func makeResultsTask(
+        _ results: some AsyncSequence<SpeechTranscriber.Result, any Error> & Sendable
     ) -> Task<Void, Never> {
         Task { [weak self] in
             do {

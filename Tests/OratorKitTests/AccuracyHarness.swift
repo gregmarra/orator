@@ -147,7 +147,7 @@ final class AccuracyHarnessTests: XCTestCase {
         guard let conv = AVAudioConverter(from: inFmt, to: target) else {
             XCTFail("no converter from \(inFmt) to \(target)"); return ""
         }
-        guard let token = await engine.beginSession(vocabulary: []) else {
+        guard let token = await engine.beginSession() else {
             XCTFail("beginSession returned nil while scoring"); return ""
         }
         conv.sampleRateConverterQuality = config.quality

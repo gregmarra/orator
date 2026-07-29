@@ -2,7 +2,7 @@ import SwiftUI
 import Carbon.HIToolbox
 
 /// The single small settings pane (ORA-CFG-001). Exactly the sanctioned controls, ≤ 8 (M5):
-/// hotkey, language, microphone policy, custom vocabulary, launch-at-login, sound.
+/// hotkey, language, microphone policy, launch-at-login, sound.
 /// No per-app profiles / workflow editor / model picker / plugins (ORA-CFG-004).
 public struct SettingsView: View {
     @State private var hotkey: HotkeyChord = Settings.shared.hotkey
@@ -13,8 +13,6 @@ public struct SettingsView: View {
     @State private var meter = MicLevelMonitor()
     @State private var launchAtLogin: Bool = LaunchAtLogin.isEnabled
     @State private var soundEnabled: Bool = Settings.shared.soundEnabled
-    @State private var vocabulary: [String] = Settings.shared.vocabulary
-    @State private var newTerm: String = ""
     @State private var recordingHotkey = false
     /// Whether this window is the active/key window. The meter holds the microphone (orange indicator,
     /// battery, and a second session on the same device a recording might use), so we only run it while
@@ -67,41 +65,14 @@ public struct SettingsView: View {
                 // performed, and simultaneously hid setup behind a button nobody wanting setup would press.
                 Button("Open Setup…") { onReset?() }
             }
-
-            // Vocabulary last: it grows as the user adds terms, so it never pushes the fixed controls;
-            // the grouped Form scrolls this section internally within the fixed window (SET-5).
-            Section {
-                HStack {
-                    TextField("Add a name or term…", text: $newTerm)
-                        .textFieldStyle(.roundedBorder)   // HIG: an editable field needs a visible bezel
-                        .onSubmit(addTerm)
-                    Button("Add", action: addTerm).disabled(newTerm.isEmpty)
-                }
-                // Editable collection: an explicit remove button (discoverable on macOS) plus
-                // `.onDelete` for keyboard/swipe delete (SET-4).
-                ForEach(vocabulary, id: \.self) { term in
-                    HStack {
-                        Text(term)
-                        Spacer()
-                        Button { vocabulary.removeAll { $0 == term } } label: {
-                            Image(systemName: "minus.circle.fill").foregroundStyle(.red)
-                        }
-                        .buttonStyle(.borderless)
-                        .accessibilityLabel("Remove \(term)")
-                    }
-                }
-                .onDelete { vocabulary.remove(atOffsets: $0) }
-            } header: {
-                Text("Custom vocabulary")
-            } footer: {
-                // Explanatory help text belongs in a section footer, not an inline caption row (SET-3).
-                Text("Names, jargon, or product terms to bias recognition toward.")
-            }
-            // Persist on any change — the same idiom the other settings use above.
-            .onChange(of: vocabulary) { _, v in Settings.shared.vocabulary = v }
         }
         .formStyle(.grouped)
-        .frame(width: 420, height: 540)
+        // Fixed width (the single-pane Settings idiom), content-driven height. The height used to be
+        // pinned at 540 so the vocabulary list could grow and scroll inside it; with that section
+        // gone the constant only produced dead space. `fixedSize` vertically is what stops the
+        // grouped Form's scroll view from claiming the space instead of reporting its ideal height.
+        .frame(width: 420)
+        .fixedSize(horizontal: false, vertical: true)
         .task { await language.reload?() }   // read supported/installed locales dynamically on open
         .onAppear { deviceList.start(); syncMeter() }     // live mic list while open; meter gated on active
         .onDisappear { deviceList.stop(); meter.stop() }
@@ -240,13 +211,6 @@ public struct SettingsView: View {
             Text("\(language.displayName(language.selectedID)) will download when selected.")
                 .font(.callout).foregroundStyle(.secondary)
         }
-    }
-
-    private func addTerm() {
-        let term = newTerm.trimmingCharacters(in: .whitespaces)
-        guard !term.isEmpty, !vocabulary.contains(term) else { return }
-        vocabulary.append(term)
-        newTerm = ""
     }
 
 }

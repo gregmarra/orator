@@ -47,7 +47,7 @@ public enum MicSelection: Codable, Equatable, Hashable, Sendable {
 /// UserDefaults-backed settings with an explicit, defaulted schema (ORA-CFG-002).
 ///
 /// Product surface is ≤ 8 controls (M5 / ORA-CFG-001): hotkey, mic policy, locale, launch-at-login,
-/// custom vocabulary, sound on/off. No per-app profiles (ORA-CFG-004).
+/// sound on/off. No per-app profiles (ORA-CFG-004).
 @MainActor
 public final class Settings {
     public static let shared = Settings()
@@ -59,7 +59,6 @@ public final class Settings {
         static let micSelection = "MicSelection"
         static let deviceNames = "DeviceNames"   // uid -> last-seen display name (for offline pins)
         static let localeIdentifier = "LocaleIdentifier"
-        static let vocabulary = "CustomVocabulary"
         static let soundEnabled = "SoundEnabled"
     }
 
@@ -104,12 +103,6 @@ public final class Settings {
     public var localeIdentifier: String {
         get { defaults.string(forKey: Key.localeIdentifier) ?? "en-US" }  // English v1 (ORA-ASR-008)
         set { defaults.set(newValue, forKey: Key.localeIdentifier) }
-    }
-
-    /// Custom vocabulary terms that bias recognition (ORA-VOC-001/002).
-    public var vocabulary: [String] {
-        get { defaults.stringArray(forKey: Key.vocabulary) ?? [] }
-        set { defaults.set(newValue, forKey: Key.vocabulary) }
     }
 
     public var soundEnabled: Bool {

@@ -132,9 +132,6 @@ final class OratorKitTests: XCTestCase {
         XCTAssertEqual(settings.localeIdentifier, "en-US")    // English v1
         XCTAssertTrue(settings.soundEnabled)
         XCTAssertEqual(settings.hotkey, .defaultChord)        // ⌥Space
-
-        settings.vocabulary = ["Acme", "Orator"]
-        XCTAssertEqual(Settings(defaults: suite).vocabulary, ["Acme", "Orator"])
     }
 
     // Mic selection persists by UID (so a pinned device is sticky across launches) and migrates the
@@ -328,39 +325,9 @@ final class OratorKitTests: XCTestCase {
     }
 }
 
-/// Custom-vocabulary biasing is only honoured by `DictationTranscriber` — `SpeechTranscriber` accepts
-/// `AnalysisContext.contextualStrings` and silently ignores them, so the feature the Settings pane
-/// advertises was a no-op. Supplying a vocabulary now switches the session to the biasing-capable
-/// transcriber, which is a different recognizer: this asserts that path still produces a real
-/// transcript (the failure mode being a session that prepares but transcribes nothing).
-final class VocabularyBiasingTests: XCTestCase {
-    @MainActor
-    func testSessionWithVocabularyStillTranscribes() async throws {
-        let url = try sayToFile("the quick brown fox jumps over the lazy dog", "orator-bias.aiff")
-        let engine = try await warmEngine(biasing: true)
-        let text = try await transcribe(url, through: engine, vocabulary: ["Orator", "Anthropic"])
-
-        XCTAssertFalse(text.isEmpty, "biasing session produced no transcript at all")
-        XCTAssertTrue(["fox", "quick", "brown", "dog"].contains { text.contains($0) },
-                      "biasing transcript did not contain expected words: '\(text)'")
-    }
-
-    /// The cap itself, asserted directly. `beginSession` swallows `setContext` failures, so a
-    /// start-still-works test cannot detect a missing cap — and an oversized array can make the
-    /// recognizer drop the WHOLE set rather than the excess, which is the failure being prevented.
-    @MainActor
-    func testVocabularyIsCappedInOrder() {
-        let huge = (0..<250).map { "term\($0)" }
-        let capped = SpeechEngine.cappedVocabulary(huge)
-        XCTAssertEqual(capped.count, SpeechEngine.maxContextualStrings)
-        XCTAssertEqual(capped.first, "term0")
-        XCTAssertEqual(capped.last, "term99", "the cap must keep the FIRST N terms, in order")
-        // An in-bounds vocabulary is passed through untouched.
-        let small = ["Orator", "Anthropic"]
-        XCTAssertEqual(SpeechEngine.cappedVocabulary(small), small)
-        XCTAssertEqual(SpeechEngine.cappedVocabulary([]), [])
-    }
-
+/// Per-session isolation: each dictation gets its own analyzer, transcriber, stream and results task,
+/// so nothing can leak or drop across sessions.
+final class SessionIsolationTests: XCTestCase {
     /// The SessionToken guard exists so a bridge that outlives its session cannot bleed the previous
     /// dictation's audio into the next transcript. Every other test feeds the token it just received,
     /// so none of them can fail if the guard is deleted — this one feeds a RETIRED token deliberately.
@@ -374,12 +341,12 @@ final class VocabularyBiasingTests: XCTestCase {
         engine.sink = collector
 
         // Session A, retired without ever being fed.
-        let startedA = await engine.beginSession(vocabulary: [])
+        let startedA = await engine.beginSession()
         let a = try XCTUnwrap(startedA)
         engine.endSession()
 
         // Session B is live. Feeding A's token must yield NOTHING into it.
-        let startedB = await engine.beginSession(vocabulary: [])
+        let startedB = await engine.beginSession()
         let b = try XCTUnwrap(startedB)
         XCTAssertNotEqual(a, b, "each session must get a distinct token")
 
@@ -429,7 +396,7 @@ final class CrossSessionTests: XCTestCase {
             collector.reset()
             let capture = FileAudioCapture(url: url, realtime: true)   // wall-clock pace, like a real mic
             let stream = try capture.start(outputFormat: format)
-            let started = await engine.beginSession(vocabulary: [])
+            let started = await engine.beginSession()
             let token = try XCTUnwrap(started)
             let bridge = Task.detached { [engine] in for await input in stream { engine.feed(input, for: token) } }
             await bridge.value

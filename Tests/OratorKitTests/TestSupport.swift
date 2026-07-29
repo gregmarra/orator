@@ -16,8 +16,8 @@ import Speech
 /// A warmed en-US engine, or a skip when the model isn't installed on this host. Owns that
 /// precondition so it isn't restated at every call site.
 @MainActor
-func warmEngine(biasing: Bool = false) async throws -> SpeechEngine {
-    let engine = SpeechEngine(locale: Locale(identifier: "en-US"), biasing: biasing)
+func warmEngine() async throws -> SpeechEngine {
+    let engine = SpeechEngine(locale: Locale(identifier: "en-US"))
     let status = await engine.modelStatus()
     try XCTSkipUnless(status == .installed, "en-US model not installed on this host")
     try await engine.warmUp()
@@ -43,12 +43,12 @@ func sayToFile(_ phrase: String, _ name: String) throws -> URL {
 /// `realtime: true` is load-bearing, not decoration: fed flat out the analyzer returns NOTHING, which
 /// once made a guard-test pass for the wrong reason.
 @MainActor
-func transcribe(_ url: URL, through engine: SpeechEngine, vocabulary: [String] = []) async throws -> String {
+func transcribe(_ url: URL, through engine: SpeechEngine) async throws -> String {
     let collector = TranscriptCollector()
     engine.sink = collector
     let capture = FileAudioCapture(url: url, realtime: true)
     let stream = try capture.start(outputFormat: try XCTUnwrap(engine.inputFormat))
-    let started = await engine.beginSession(vocabulary: vocabulary)
+    let started = await engine.beginSession()
     let token = try XCTUnwrap(started, "beginSession must report a started session")
     let bridge = Task.detached { [engine] in for await input in stream { engine.feed(input, for: token) } }
     await bridge.value                          // drains when the file hits EOF

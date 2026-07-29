@@ -13,10 +13,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
     private let recovery = RecoveryBuffer()
     private let inserter = TextInserter()
     private let audio = AudioCapture()
-    // Seed the biasing preference so the very first dictation's PREPARED session is already the
-    // vocabulary-capable kind, instead of having to build one inline on the hotkey path.
-    private lazy var engine = SpeechEngine(locale: Settings.shared.locale,
-                                           biasing: !Settings.shared.vocabulary.isEmpty)
+    private lazy var engine = SpeechEngine(locale: Settings.shared.locale)
     private lazy var coordinator = SessionCoordinator(
         audio: audio, engine: engine, inserter: inserter,
         recovery: recovery, permissions: permissions, feedback: feedback)
@@ -63,21 +60,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         do { try await engine.warmUp() }
         catch { Log.speech.error("warmUp failed: \(error.localizedDescription)") }
         await coordinator.refreshReadiness()
-        await ensureVocabularyBiasingUsable()
-    }
-
-    /// A custom vocabulary only biases recognition on `DictationTranscriber`, whose asset is NOT
-    /// implied by the one an existing install already has. Fetch it in the background once, after warm
-    /// -up, so the advertised feature actually works instead of silently degrading — and tell the user
-    /// if it can't be had, since the alternative is a Settings pane promising something inert.
-    private func ensureVocabularyBiasingUsable() async {
-        guard !Settings.shared.vocabulary.isEmpty else { return }
-        guard await !engine.biasingAssetInstalled() else { return }
-        if await engine.ensureBiasingAsset() {
-            Log.speech.notice("Custom vocabulary is now active")
-        } else {
-            coordinator.reportVocabularyUnavailable()
-        }
     }
 
     private func refreshAndWarm() async {
@@ -370,10 +352,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         // freshly-created hosting controller reports a ~1×32 fitting size).
         hosting.view.layoutSubtreeIfNeeded()
         let fit = hosting.view.fittingSize
-        if fit.width > 50, fit.height > 50 { w.setContentSize(fit) }
-        // Persist + restore the window position across opens; center only on the very first launch.
+        let usable = fit.width > 50 && fit.height > 50
+        if usable { w.setContentSize(fit) }   // size before centering, or `center()` is off by half
+        // Persist + restore the window POSITION across opens; center only on the very first launch.
         w.setFrameAutosaveName(autosave)
-        if !w.setFrameUsingName(autosave) { w.center() }
+        if w.setFrameUsingName(autosave) {
+            // A restored frame carries its saved SIZE too. Left alone, an install that saved a frame
+            // when the pane was taller stays pinned to that stale height forever — the content
+            // shrinks and the window doesn't. Re-apply the fitting size so autosave contributes
+            // position only.
+            if usable { w.setContentSize(fit) }
+        } else {
+            w.center()
+        }
         return w
     }
 }
