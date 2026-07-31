@@ -1,9 +1,11 @@
 import Foundation
+import CoreAudio
 @preconcurrency import AVFoundation
 import Observation
+import os
 
 /// Drives the Settings input-level meter. Runs a private `AudioCapture` on the currently-selected
-/// device (via the same `AudioCapture.resolveDevice()` the real recording uses), so the bar shows
+/// device (via the same `AudioCapture.resolveChoice()` the real recording uses), so the bar shows
 /// precisely what a recording would capture. Lives only while the Settings pane is open — it is never
 /// on the hotkey→capture-start path, so its cost doesn't affect start latency.
 @MainActor
@@ -16,8 +18,9 @@ final class MicLevelMonitor {
     private(set) var resolvedName: String?
     /// UID of that device, so the view can prefer the picker's name for it (consistent naming).
     private(set) var resolvedUID: String?
-    /// True when the resolved device is a *substitute* for the selection (pinned mic absent, garbage
-    /// default, no built-in) — the readout uses it to show the effective mode (ORA-CAP-005).
+    /// True when the resolved device is a *substitute* for the selection (garbage default, or no
+    /// built-in when Built-in is selected) — the readout uses it to show the effective mode
+    /// (ORA-CAP-025).
     private(set) var substituted = false
     /// Set when a real, resolved device could not be *opened* (busy/exclusive) — distinct from
     /// "no device exists", so the readout doesn't wrongly claim the mic is missing.
@@ -33,16 +36,22 @@ final class MicLevelMonitor {
     @ObservationIgnored private var poll: Task<Void, Never>?
     @ObservationIgnored private var running = false
 
-    /// 16 kHz mono — matches the analyzer format. The value is irrelevant for metering (we only read
-    /// the RMS level the capture computes), but a concrete format is required to start capture.
+    /// Core Audio listener blocks, kept so we can remove exactly what we added. Registered while the
+    /// meter is live and torn down with it, so a device change can't re-acquire the mic once the
+    /// Settings window is inactive — the gate the view used to apply externally.
     @ObservationIgnored
-    private static let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000,
-                                              channels: 1, interleaved: false)!
+    private var registered: [(AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
+    @ObservationIgnored private var restartPending = false
+    /// Bumped on teardown so an in-flight debounced restart from a previous session no-ops.
+    @ObservationIgnored private var restartGeneration = 0
 
     init() {}
 
     /// Start metering the currently-selected device. Idempotent.
     func start() {
+        // Listen regardless of whether capture then succeeds: if no usable input exists right now, a
+        // device appearing later is exactly the event that should bring the meter to life.
+        listenForDeviceChanges()
         guard !running else { return }
         let choice = AudioCapture.resolveChoice()
         resolvedName = choice.device?.localizedName
@@ -61,7 +70,7 @@ final class MicLevelMonitor {
         do {
             // Metering: the sink derives RMS from the raw buffer and never yields — so the stream
             // stays empty and we don't consume it (no backlog to drain).
-            _ = try capture.startMetering(outputFormat: Self.format)
+            _ = try capture.startMetering()
             running = true
             poll = Task { [weak self] in
                 while !Task.isCancelled {
@@ -81,17 +90,65 @@ final class MicLevelMonitor {
 
     /// Stop metering and release the mic. Idempotent.
     func stop() {
+        stopListening()
         poll?.cancel(); poll = nil
         if running { capture.stop() }
         running = false
         level = 0
     }
 
+    // MARK: Device-change tracking
+
+    /// Re-meter when the set of inputs or the system default changes (AirPods connecting, a hub
+    /// waking) so the readout and the bar follow what a recording would actually capture. This lived
+    /// in a separate `AudioDeviceList` whose only other job was populating a per-device picker; with
+    /// that picker gone (ORA-CAP-002), the meter is the sole consumer and owns it directly.
+    private func listenForDeviceChanges() {
+        guard registered.isEmpty else { return }
+        for selector in [kAudioHardwarePropertyDevices, kAudioHardwarePropertyDefaultInputDevice] {
+            // Delivered on the main queue, so assumeIsolated is safe. Weak so the listener never keeps
+            // the monitor alive past stop().
+            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                MainActor.assumeIsolated { self?.scheduleRestart() }
+            }
+            let (addr, status) = CoreAudioSupport.addSystemListener(selector, block)
+            if status == noErr { registered.append((addr, block)) }
+            else { Log.audio.error("Failed to add CoreAudio listener for \(selector, privacy: .public): \(status)") }
+        }
+    }
+
+    private func stopListening() {
+        for (addr, block) in registered {
+            var a = addr
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &a,
+                                                   DispatchQueue.main, block)
+        }
+        registered.removeAll()
+        restartGeneration &+= 1   // cancel any pending debounced restart from this session
+        restartPending = false
+    }
+
+    /// Coalesce a burst of change callbacks (docks/hubs re-registering) into one restart, and — the
+    /// load-bearing part — get off the Core Audio callback before tearing the capture session down,
+    /// since `restart()` removes the very listener block that is currently executing.
+    private func scheduleRestart() {
+        guard !restartPending else { return }
+        restartPending = true
+        let gen = restartGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, gen == self.restartGeneration else { return }
+                self.restartPending = false
+                self.restart()
+            }
+        }
+    }
+
     /// Re-resolve and meter the newly-selected device (call when the selection, system default, or
     /// device list changes). No-op when the resolved device is unchanged, so plug/unplug bursts and
     /// redundant onChange fires don't needlessly tear down and rebuild the capture session (ORA-CAP-008).
     func restart() {
-        let newUID = AudioCapture.resolveDevice()?.uniqueID
+        let newUID = AudioCapture.resolveChoice().device?.uniqueID
         if running, newUID == resolvedUID { return }
         stop()
         start()

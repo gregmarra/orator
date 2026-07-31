@@ -253,7 +253,11 @@ public final class SessionCoordinator: SpeechResultSink {
         case .idle:
             guard !starting else { return }   // start already in flight (ORA-SM-003)
             guard readiness.canStartDictation else {
+                // The cue ALONE is not feedback: sound is user-disableable (ORA-FBK-001), so with it off
+                // this path was completely silent and invisible — the hotkey did nothing, forever, with
+                // no way to find out why. Every failure must also take a visible/spoken channel.
                 feedback.playError()
+                showNotice(readiness.shortReason)
                 Log.session.notice("Hotkey ignored: not ready (\(String(describing: self.readiness)))")
                 return
             }
@@ -283,19 +287,44 @@ public final class SessionCoordinator: SpeechResultSink {
 
     // MARK: Recording
 
+    /// Downgrade `readiness` to `.needsModel` ONLY when the model really is the problem, returning
+    /// whether it did.
+    ///
+    /// Both start failures — a cold engine and a nil `beginSession` — can be transient (a prepare or
+    /// start that threw, a busy speech daemon) with the asset perfectly present. `.needsModel(.installed)`
+    /// still fails `canStartDictation`, so downgrading on a transient fault kills the hotkey outright and
+    /// points Setup at downloading an already-installed model, with recovery only on the next menu-open.
+    /// This rule is subtle and gates the hotkey, so it lives in exactly one place; each caller adds only
+    /// its own follow-up (an inline error vs. a full abort).
+    private func downgradeReadinessIfModelUnavailable() async -> Bool {
+        let status = await engine.modelStatus()
+        guard status != .installed else { return false }
+        readiness = .needsModel(status)
+        return true
+    }
+
+    /// The ONE way a failed start is reported, on every channel: the menu-bar tooltip (persistent), the
+    /// indicator notice (transient, and spoken to VoiceOver), and the error cue.
+    ///
+    /// These three things used to be assembled per-site, and every site had dropped the notice — so a
+    /// failed start was announced by sound alone. Sound is user-disableable (ORA-FBK-001), which made
+    /// the whole class of start failures completely silent AND invisible for anyone with cues off: the
+    /// hotkey simply did nothing, with no way to discover why.
+    private func failStart(_ reason: String) {
+        setError(reason)
+        showNotice(reason)
+        feedback.playError()
+    }
+
     private func startRecording() async {
         let began = ContinuousClock.now
         defer { starting = false }
         guard state == .idle else { return }
         guard engine.isWarm, let format = engine.inputFormat else {
             Log.session.error("Cannot start: engine not warm")
-            // As in the `beginSession` failure below: only claim a MODEL problem when the model really
-            // is the problem. An engine that failed to warm with the asset present is a transient
-            // fault, and `.needsModel(.installed)` would disable the hotkey outright.
-            let status = await engine.modelStatus()
-            if status != .installed { readiness = .needsModel(status) }
-            else { setError("Speech engine isn’t ready yet — try again.") }
-            feedback.playError()
+            // A model problem renames itself via readiness; anything else is a transient engine fault.
+            if await downgradeReadinessIfModelUnavailable() { failStart(readiness.shortReason) }
+            else { failStart("Speech engine isn’t ready yet — try again.") }
             return
         }
         // TCC mic access can be revoked after launch; capturing without it doesn't throw — it just
@@ -304,8 +333,7 @@ public final class SessionCoordinator: SpeechResultSink {
         guard permissions.microphoneGranted else {
             Log.session.error("Cannot start: microphone permission not granted")
             readiness = .needsPermission(permissions.missing())
-            setError("Microphone access is off. Enable it in System Settings.")
-            feedback.playError()
+            failStart("Microphone access is off. Enable it in System Settings.")
             return
         }
 
@@ -326,10 +354,9 @@ public final class SessionCoordinator: SpeechResultSink {
         do {
             stream = try audio.start(outputFormat: format)
         } catch {
-            // Capture failed to start ⇒ stay idle, no indicator, legible reason (ORA-SM-004 / E5).
+            // Capture failed to start ⇒ stay idle, legible reason on every channel (ORA-SM-004 / E5).
             Log.session.error("Audio start failed: \(error.localizedDescription)")
-            setError("Couldn’t start the microphone.")
-            feedback.playError()
+            failStart("Couldn’t start the microphone.")
             return
         }
 
@@ -361,14 +388,8 @@ public final class SessionCoordinator: SpeechResultSink {
         // No transcriber attached ⇒ every buffer would be silently discarded while the indicator,
         // timer and start cue all claim a live dictation. Fail loudly instead (ORA-REL-001).
         guard let token else {
-            // Only downgrade readiness if the MODEL is actually the problem. `beginSession` also
-            // returns nil for a transient engine hiccup (prepare/start throwing, a busy speech daemon),
-            // and `.needsModel(.installed)` still fails `canStartDictation` — which would kill the
-            // hotkey and point Setup at downloading an already-installed model, with recovery only on
-            // the next menu-open. The abort's own error + notice already explain the failure.
-            let status = await engine.modelStatus()
-            if status != .installed { readiness = .needsModel(status) }
-            abortSession(reason: "Couldn’t start transcription.")
+            _ = await downgradeReadinessIfModelUnavailable()
+            abortSession(reason: "Couldn’t start transcription.")   // the abort's error + notice explain it
             return
         }
         sessionToken = token

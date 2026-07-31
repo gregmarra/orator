@@ -71,17 +71,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     // MARK: Observation → UI (status icon + indicator)
 
+    /// Track exactly what `render()` reads, by reading it *through* `render()` rather than restating
+    /// the property list by hand. The hand-maintained list this replaces had already drifted —
+    /// `recentError` (read by the status tooltip) and `confirmedText` (read by the indicator preview)
+    /// were missing, and both refreshed only because they happened to co-change with a tracked
+    /// property. `render()` is fully synchronous, so observation tracking sees every access.
     private func startObserving() {
-        render()
-        withObservationTracking {
-            _ = coordinator.state
-            _ = coordinator.readiness
-            _ = coordinator.elapsed
-            _ = coordinator.audioLevel
-            _ = coordinator.volatilePreview
-            _ = coordinator.notice
-        } onChange: { [weak self] in
-            // startObserving() re-renders as its first line, then re-subscribes.
+        withObservationTracking { render() } onChange: { [weak self] in
+            // Re-subscribing re-renders: render() is the tracked block's first and only statement.
             Task { @MainActor in self?.startObserving() }
         }
     }
@@ -159,7 +156,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
     private func wireStatusItem() {
         statusItem.onOpenSettings = { [weak self] in self?.showSettings() }
         statusItem.onQuit = { NSApp.terminate(nil) }
-        statusItem.onFixReadiness = { [weak self] in self?.handleFixReadiness() }
+        statusItem.onRetryModelDownload = { [weak self] in self?.showOnboarding() }
         statusItem.onCancelDictation = { [weak self] in self?.coordinator.cancel() }
         statusItem.onGrantMicrophone = { [weak self] in
             Task { _ = await self?.permissions.requestMicrophone(); await self?.refreshAndWarm() }
@@ -209,25 +206,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
                 Log.speech.notice("Language switch failed: \(error.localizedDescription)")
                 self.language.errorText = "Couldn't install \(self.language.displayName(id)) — \(error.localizedDescription)"
                 self.language.selectedID = self.language.appliedID
-                try? await self.engine.rewarm(locale: Locale(identifier: self.language.appliedID))
+                // Revert to the locale that was working. `switchLocale` covers this: the applied
+                // locale's model is installed by definition, so its install step is a no-op and it
+                // reduces to exactly the rebuild-and-warm this path used to call separately.
+                try? await self.engine.switchLocale(Locale(identifier: self.language.appliedID)) { _ in }
             }
             self.language.downloadingID = nil
             await self.coordinator.refreshReadiness()
             self.render()
-        }
-    }
-
-    private func handleFixReadiness() {
-        switch coordinator.readiness {
-        case .needsPermission(let missing):
-            // Also open the guided setup window, not just the System Settings deep links: it is the
-            // screen that explains what each grant is for and carries the per-permission reset.
-            for kind in missing { permissions.openSettings(for: kind) }
-            showOnboarding()
-        case .needsModel:
-            showOnboarding()
-        default:
-            break
         }
     }
 
@@ -278,6 +264,21 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
     }
 
     // MARK: Windows
+
+    /// Re-opening Orator.app (Finder, Spotlight, `open -a`) surfaces Settings.
+    ///
+    /// This is the app's ONLY recovery route if the menu bar extra isn't reachable. Apple is explicit
+    /// that we can't count on it being there — "the system hides and shows menu bar extras regularly…
+    /// if there are too many menu bar extras, the system may hide some to avoid crowding app menus" —
+    /// and on a notched Mac with a few extras that is routine. Orator has no Dock icon, and the ⌘,
+    /// main-menu item only exists once a window is already open, so without this a hidden status item
+    /// left no way to reach Settings, Setup, or Quit short of Activity Monitor. Launching an already-
+    /// running app is exactly what a user does next, so that's the hook.
+    public func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        Log.session.notice("Reopen requested (hasVisibleWindows=\(hasVisibleWindows)) — surfacing Settings")
+        if !hasVisibleWindows { showSettings() }
+        return true
+    }
 
     // Create SwiftUI windows on a fresh run-loop turn, NOT synchronously inside a status-menu action.
     // Building an NSHostingController's SwiftUI content while NSMenu tracking is unwinding trips a

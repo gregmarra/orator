@@ -39,6 +39,19 @@ public enum Readiness: Equatable, Sendable {
         case .needsModel: return false
         }
     }
+
+    /// One user-facing phrase naming what is wrong — empty when nothing is. The SINGLE definition,
+    /// shared by every surface that has to explain a blocked dictation: the menu-bar banner and the
+    /// indicator notice shown when the hotkey is pressed while not ready. Previously this wording was
+    /// private to `StatusItemController`, so the hotkey path had nothing to say and said nothing.
+    public var shortReason: String {
+        switch self {
+        case .ready: return ""
+        case .degradedHotkey: return "Hotkey degraded — secure input is active"
+        case .needsPermission(let p): return "Missing: \(p.ordered.map(\.title).joined(separator: ", "))"
+        case .needsModel(let status): return "Speech model — \(status.summary)"
+        }
+    }
 }
 
 /// The four icon states the menu-bar item must encode (ORA-IND-001).

@@ -63,7 +63,6 @@ func transcribe(_ url: URL, through engine: SpeechEngine) async throws -> String
 @MainActor
 final class TranscriptCollector: SpeechResultSink {
     private(set) var confirmed = ""
-    func reset() { confirmed = "" }
     func speechDidConfirm(_ text: String) {
         if !confirmed.isEmpty { confirmed += " " }
         confirmed += text

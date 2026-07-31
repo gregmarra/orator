@@ -11,7 +11,10 @@ public final class StatusItemController: NSObject, NSMenuDelegate {
 
     public var onOpenSettings: (() -> Void)?
     public var onQuit: (() -> Void)?
-    public var onFixReadiness: (() -> Void)?
+    /// Named for the one menu item that invokes it ("Retry Model Download…", built only under
+    /// `.needsModel`). The former generic name invited a readiness switch in the handler whose
+    /// permission arms could never run — permissions have their own items below.
+    public var onRetryModelDownload: (() -> Void)?
     public var onCancelDictation: (() -> Void)?
     public var onGrantMicrophone: (() -> Void)?
     public var onGrantAccessibility: (() -> Void)?
@@ -139,7 +142,7 @@ public final class StatusItemController: NSObject, NSMenuDelegate {
         // Not-ready banner + actionable remediation (ORA-IND-002, §10.3 name-the-fix). These are
         // plain AppKit menu items — the reliable, crash-free way to run setup.
         if let readiness = coordinator?.readiness, readiness != .ready {
-            let banner = NSMenuItem(title: readinessTitle(readiness), action: nil, keyEquivalent: "")
+            let banner = NSMenuItem(title: readiness.shortReason, action: nil, keyEquivalent: "")
             banner.isEnabled = false
             menu.addItem(banner)
             switch readiness {
@@ -151,7 +154,7 @@ public final class StatusItemController: NSObject, NSMenuDelegate {
                     addItem(menu, "Grant Accessibility…", #selector(grantAccessibility), symbol: "accessibility")
                 }
             case .needsModel:
-                addItem(menu, "Retry Model Download…", #selector(fixReadiness), symbol: "arrow.down.circle")
+                addItem(menu, "Retry Model Download…", #selector(retryModelDownload), symbol: "arrow.down.circle")
             default:
                 break
             }
@@ -184,15 +187,6 @@ public final class StatusItemController: NSObject, NSMenuDelegate {
         addItem(menu, "Quit Orator", #selector(quit), keyEquivalent: "q")
     }
 
-    private func readinessTitle(_ r: Readiness) -> String {
-        switch r {
-        case .ready: return ""
-        case .degradedHotkey: return "Hotkey degraded — secure input is active"
-        case .needsPermission(let p): return "Missing: \(p.ordered.map(\.title).joined(separator: ", "))"
-        case .needsModel(let status): return "Speech model — \(status.summary)"
-        }
-    }
-
     // MARK: Actions
 
     @objc private func copyEntry(_ sender: NSMenuItem) {
@@ -208,7 +202,7 @@ public final class StatusItemController: NSObject, NSMenuDelegate {
 
     @objc private func openSettings() { onOpenSettings?() }
     @objc private func quit() { onQuit?() }
-    @objc private func fixReadiness() { onFixReadiness?() }
+    @objc private func retryModelDownload() { onRetryModelDownload?() }
     @objc private func cancelDictation() { onCancelDictation?() }
     @objc private func grantMicrophone() { onGrantMicrophone?() }
     @objc private func grantAccessibility() { onGrantAccessibility?() }

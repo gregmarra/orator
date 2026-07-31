@@ -147,7 +147,7 @@ device-specific behavior (e.g. display geometry) **MUST** be derived dynamically
 | Global hotkey | **Carbon** `RegisterEventHotKey` (primary); **CoreGraphics** event tap (scoped, only for Escape capture while recording) |
 | Text insertion & focus | **ApplicationServices / Accessibility** (`AXUIElement`) and **CoreGraphics** (`CGEvent`) |
 | Display geometry | **AppKit** `NSScreen` (`safeAreaInsets`, `auxiliaryTopLeftArea`, `auxiliaryTopRightArea`) |
-| Microphone selection | **AVFoundation** `AVCaptureDevice` (follow the system default, or pin the built-in only; the built-in is matched by CoreAudio transport type) |
+| Microphone selection | **AVFoundation** `AVCaptureDevice` (follow the system default, or pin the built-in — those two only, never an arbitrary device by UID; the built-in is matched by CoreAudio transport type) |
 | Launch at login | **ServiceManagement** (`SMAppService`) |
 
 **No third-party runtime dependencies (ORA-PLAT-003, MUST).** The on-device model is provided and stored
@@ -285,6 +285,15 @@ Invariants (all MUST):
   controls start/stop; silence detection adds complexity and failure modes for no required benefit.
 - ORA-SM-012 (MUST): On cancel (Escape), the coordinator MUST discard audio, confirmed text, and volatile
   text, tear down capture, and return to `idle`, with no insertion and no recovery-buffer entry.
+- ORA-SM-013 (MUST): Elapsed time and the max-duration auto-stop MUST be measured from a **monotonic**
+  clock (`ContinuousClock`), never wall-clock `Date`. *Rationale: an NTP correction, a DST change, or a
+  manual clock adjustment mid-dictation would otherwise skew the displayed timer and could mis-fire the
+  auto-stop.*
+- ORA-SM-014 (MUST): Starting a dictation crosses suspension points. On resuming from one, the coordinator
+  MUST re-check that the session is still `recording` and abandon otherwise — reaping anything it started
+  in the meantime. *Rationale: a second hotkey press during start-up ends the session concurrently; without
+  the re-check the resumed start wires an audio bridge and tick timer to a torn-down session, feeding audio
+  into the engine after teardown (duplicate or garbled text) and leaking an analyzer that holds the model.*
 
 ### 8.3 Audio Capture
 
@@ -305,6 +314,14 @@ Invariants (all MUST):
   by its CoreAudio **transport type** (`kAudioDeviceTransportTypeBuiltIn`) matched to an `AVCaptureDevice` by
   UID, not by a name substring — on Apple Silicon the built-in is named for the model ("MacBook Air
   Microphone"), so a name match can fall through to a flaky Continuity/iPhone mic that disconnects mid-session.
+  The microphone control has **exactly these two states** and MUST NOT offer a pin to an arbitrary device
+  by UID. *Rationale: an implementation once added a third "pin this specific device" state. On a machine
+  whose system default IS the built-in — the common case — all three options resolved to the same device,
+  so the picker offered a three-way choice with one outcome and no way for a user to tell two of the rows
+  apart. The states diverged only in an undiscoverable fallback ordering after the pinned device died.
+  It also dragged in a live device enumeration, a remembered-device-name store, and a name-collision
+  disambiguation rule — none of which serve recognition accuracy. A user whose preferred mic isn't the
+  system default changes it in System Settings, which is where that choice already lives.*
 - ORA-CAP-003 (MUST): Orator MUST handle audio configuration changes mid-session (a headset connecting):
   `AVCaptureSession` recovers from most device changes itself; the sample-buffer delegate rebuilds the
   `AVAudioConverter` when the input format changes, and confirmed text MUST survive (ORA-SM-002). A session
@@ -317,6 +334,48 @@ Invariants (all MUST):
   privacy cost.
 - ORA-CAP-006 (MUST): The audio graph MUST be **prepared while warm** (§8.11) so starting a dictation does not
   pay audio-graph setup latency (M1).
+- ORA-CAP-004 (MUST): **All** `AVCaptureSession` mutation — configuration, `startRunning`, and `stopRunning` —
+  MUST be serialized on a single queue. *Rationale: dispatched concurrently, a rapid stop→start (e.g. the
+  Settings meter restarting) can reorder, leaving the session running after a stop (the microphone is never
+  released) or stopped after a start (capture is dead while the UI claims otherwise).*
+- ORA-CAP-013 (MUST): That serialization MUST NOT block the main actor — `stopRunning` is dispatched
+  asynchronously onto the serial queue (ORA-CAP-004), never awaited from the main actor.
+- ORA-CAP-014 (MUST): `AVCaptureSession` is not thread-safe. Its state (e.g. `isRunning`) MUST be read on its
+  own serial queue, never off-queue, even for a diagnostic check.
+- ORA-CAP-007 (SHOULD): The built-in input UID MUST be memoized **including the negative result**, so a Mac
+  with no built-in transport does not re-enumerate Core Audio on every record start (the hotkey→capture-start
+  hot path, M1). A cached positive self-heals via an O(1) presence check.
+- ORA-CAP-024 (MUST): A single **process-lifetime** Core Audio device-change listener MUST invalidate that
+  memo, so the negative result re-probes when a built-in microphone reappears (clamshell, undock, replug)
+  even while Settings is closed — otherwise built-in mode stays stuck at "no built-in" indefinitely.
+- ORA-CAP-016 (MUST): "An input we can capture from" has ONE definition — it has input channels (Core Audio)
+  **and** is vendable as an `AVCaptureDevice` — shared by device selection and every Settings surface, so the
+  two cannot disagree. This excludes aggregate/virtual devices that pass a channel check but cannot be opened.
+- ORA-CAP-012 (SHOULD): The device-selection decision MUST be a pure function over an injectable view of the
+  device world, so every fallback and substitution branch is testable headlessly, without hardware.
+- ORA-CAP-025 (MUST): When the resolved device is **not** the one the selection asked for, the Settings
+  readout MUST state the effective mode ("Automatic (name)") rather than naming a mode that is not in force.
+  *Rationale: claiming "Built-in (Some USB Mic)" sends the user chasing the wrong fix.*
+- ORA-CAP-015 (SHOULD): Capture failures MUST carry distinct, legible, user-facing copy, kept in sync with the
+  Settings meter readout so the two failure surfaces cannot drift apart.
+- ORA-CAP-018 (MUST): Microphone TCC access can be revoked after launch, and capturing without it does **not**
+  throw — it silently delivers silence. Record start MUST re-check access (O(1)) so a revoked microphone
+  surfaces as a permission problem rather than a dead-air recording.
+- ORA-CAP-022 (MUST): A normal stop MUST NOT be reported as an unrecoverable capture failure. Both leave the
+  session not-running, but conflating them diverts the just-transcribed text to the recovery buffer instead of
+  inserting it.
+- ORA-CAP-023 (MUST): On a graceful stop, the audio bridge backlog MUST be **drained** into the recognizer
+  before finalization, so speech captured just before the stop is transcribed. (The cancel path deliberately
+  cancels instead, discarding it.) Bounded by the backlog present when the stream is finished.
+- ORA-CAP-010 (MUST): The Settings level meter MUST run only while the Settings window is frontmost, and MUST
+  release the microphone otherwise — it may never hold the input device in the background, nor open a second
+  session on a device that is being dictated into.
+- ORA-CAP-008 (SHOULD): Re-resolving that meter MUST be a no-op when the resolved device is unchanged, so
+  plug/unplug bursts and redundant change notifications don't needlessly tear down and rebuild a capture
+  session.
+- ORA-CAP-021 (SHOULD): The Settings level bar and its status line MUST be exposed to VoiceOver as **one**
+  element whose spoken value carries both the live level and the resolved-device/error state. *Rationale: the
+  bar alone announces "0 percent" while silent — indistinguishable from a dead microphone.*
 
 ### 8.4 Speech Recognition
 

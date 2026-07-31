@@ -4,8 +4,6 @@ import AppKit
 import Carbon.HIToolbox
 @testable import OratorKit
 
-private final class ConsumeOnce: @unchecked Sendable { var done = false }
-
 /// Automated verification for the requirements that have a testable seam (§15.1 "test").
 final class OratorKitTests: XCTestCase {
 
@@ -134,19 +132,18 @@ final class OratorKitTests: XCTestCase {
         XCTAssertEqual(settings.hotkey, .defaultChord)        // ⌥Space
     }
 
-    // Mic selection persists by UID (so a pinned device is sticky across launches) and migrates the
-    // legacy "MicPolicy" key. Round-trips through the compact storage form.
+    // Mic selection persists and migrates the legacy "MicPolicy" key. Round-trips through the compact
+    // storage form. ORA-CAP-002 allows exactly two states — a retired `device:<uid>` pin written by an
+    // older build MUST read back as `.automatic` rather than stranding that install on a dead pin.
     @MainActor
     func testMicSelectionPersistenceAndMigration() {
-        // Storage form round-trips all three cases.
-        for sel: MicSelection in [.automatic, .builtIn, .device(uid: "ABC-USB-Cam:1")] {
+        for sel: MicSelection in [.automatic, .builtIn] {
             XCTAssertEqual(MicSelection(storageValue: sel.storageValue), sel)
         }
-        // A pinned device persists by UID.
         let suite = UserDefaults(suiteName: "OratorTests-\(UUID().uuidString)")!
         let settings = Settings(defaults: suite)
-        settings.micSelection = .device(uid: "ABC-USB-Cam:1")
-        XCTAssertEqual(Settings(defaults: suite).micSelection, .device(uid: "ABC-USB-Cam:1"))
+        settings.micSelection = .builtIn
+        XCTAssertEqual(Settings(defaults: suite).micSelection, .builtIn)
 
         // Legacy MicPolicy values migrate: followDefault → automatic, builtIn → builtIn.
         let legacy = UserDefaults(suiteName: "OratorTests-\(UUID().uuidString)")!
@@ -154,55 +151,26 @@ final class OratorKitTests: XCTestCase {
         XCTAssertEqual(Settings(defaults: legacy).micSelection, .automatic)
         legacy.set("builtIn", forKey: "MicPolicy")
         XCTAssertEqual(Settings(defaults: legacy).micSelection, .builtIn)
+
+        // The retired per-device pin.
+        let pinned = UserDefaults(suiteName: "OratorTests-\(UUID().uuidString)")!
+        pinned.set("device:ABC-USB-Cam:1", forKey: "MicSelection")
+        XCTAssertEqual(Settings(defaults: pinned).micSelection, .automatic)
     }
 
     // ORA-IND-012: panel size is a pure function of notch/pill — independent of preview text length.
+    //
+    // The text-independence half of this is enforced by the TYPE, not by an assertion:
+    // `IndicatorMetrics.size(isNotch:)` takes no text parameter, so there is nothing for a preview
+    // string to influence. (This test used to "prove" it by calling that function twice through a
+    // helper that discarded its own `text` argument — two identical calls, which could not fail.)
     func testFixedIndicatorSizeIndependentOfText() {
-        func size(for text: String, isNotch: Bool) -> CGSize {
-            _ = IndicatorContent(state: .recording, elapsed: 0,
-                                 level: 0.5, previewTail: text, isNotch: isNotch)
-            return IndicatorMetrics.size(isNotch: isNotch)   // size never reads the content text
-        }
-        XCTAssertEqual(size(for: "hi", isNotch: false),
-                       size(for: String(repeating: "long ", count: 40), isNotch: false))
-        XCTAssertEqual(size(for: "hi", isNotch: true),
-                       size(for: String(repeating: "long ", count: 40), isNotch: true))
         // Notch panel is taller than the pill: content sits BELOW the opaque notch band
         // (ORA-IND-011), so height = notchBand + contentHeight.
         XCTAssertGreaterThan(IndicatorMetrics.size(isNotch: true).height,
                              IndicatorMetrics.size(isNotch: false).height)
         XCTAssertEqual(IndicatorMetrics.size(isNotch: true, notchBand: 32).height,
                        32 + IndicatorMetrics.contentHeight)
-    }
-
-    // ORA-CAP-001 regression: an AVAudioConverter fed one capture buffer at a time (the one-shot
-    // pattern the sink uses) consumes it, produces valid downsampled output, THEN reports
-    // `.inputRanDry` — NOT `.haveData`. So the sink must accept any non-error status that yielded
-    // frames; gating on `.haveData` alone drops every buffer and silently kills capture.
-    func testConverterReportsInputRanDryYetProducesFrames() throws {
-        let inFmt = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000,
-                                                channels: 1, interleaved: false))
-        let outFmt = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000,
-                                                 channels: 1, interleaved: false))
-        let converter = try XCTUnwrap(AVAudioConverter(from: inFmt, to: outFmt))
-
-        let inBuf = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: inFmt, frameCapacity: 512))
-        inBuf.frameLength = 512
-        for i in 0..<512 { inBuf.floatChannelData![0][i] = sinf(Float(i) * 0.1) * 0.5 }
-
-        let ratio = outFmt.sampleRate / inFmt.sampleRate
-        let out = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: outFmt,
-                                                 frameCapacity: AVAudioFrameCount(Double(512) * ratio) + 1024))
-        let once = ConsumeOnce()
-        var err: NSError?
-        let status = converter.convert(to: out, error: &err) { _, s in
-            if once.done { s.pointee = .noDataNow; return nil }
-            once.done = true; s.pointee = .haveData; return inBuf
-        }
-
-        XCTAssertNil(err)
-        XCTAssertEqual(status, .inputRanDry)          // NOT .haveData — the crux of the bug
-        XCTAssertGreaterThan(out.frameLength, 0)      // …yet the output is real and must be kept
     }
 
     // ORA-INS-004: the paste key code resolves to the key that types "v" in the current layout —
@@ -229,28 +197,6 @@ final class OratorKitTests: XCTestCase {
         XCTAssertEqual(AudioCapture.cachedBuiltInInputUID(), builtInUID)
     }
 
-    // The garbage-input fix (ORA-CAP-006): the automatic/built-in fallback must NEVER hand back a
-    // device that isn't a usable, channel-bearing input — otherwise a webcam that advertises silent
-    // audio produces a dead-mic recording. bestUsableInput() is the terminal fallback for every path.
-    @MainActor
-    func testBestUsableInputIsAlwaysUsable() throws {
-        try XCTSkipUnless(!CoreAudioSupport.inputDeviceList().isEmpty, "no inputs on this host")
-        let dev = try XCTUnwrap(AudioCapture.bestUsableInput(), "expected some usable input to exist")
-        XCTAssertTrue(CoreAudioSupport.isUsableInput(uid: dev.uniqueID),
-                      "bestUsableInput returned a non-usable (garbage) device: \(dev.localizedName)")
-    }
-
-    // ORA-CAP-009: a device's last-seen name is remembered by UID so an unplugged pinned device can
-    // still be shown by name.
-    @MainActor
-    func testDeviceNameMemoryRoundTrips() {
-        let suite = UserDefaults(suiteName: "OratorTests-\(UUID().uuidString)")!
-        let s = Settings(defaults: suite)
-        XCTAssertNil(s.rememberedDeviceName(for: "USB-Cam:1"))
-        s.rememberDeviceNames(["USB-Cam:1": "Work USB Camera", "Built-in": "MacBook Air Microphone"])
-        XCTAssertEqual(Settings(defaults: suite).rememberedDeviceName(for: "USB-Cam:1"), "Work USB Camera")
-        XCTAssertEqual(Settings(defaults: suite).rememberedDeviceName(for: "Built-in"), "MacBook Air Microphone")
-    }
 
     // ORA-CAP-012: the pure selection decision, exercised headlessly with a fake DeviceProvider —
     // every fallback/substitution branch without touching hardware.
@@ -271,21 +217,17 @@ final class OratorKitTests: XCTestCase {
         r = AudioCapture.resolveUID(.automatic, using: provider("D", "B", usable: ["B"], ordered: ["D", "B"]))
         XCTAssertEqual(r.uid, "B"); XCTAssertTrue(r.substituted)
 
+        // builtIn + present and usable → as-selected, not substituted
+        r = AudioCapture.resolveUID(.builtIn, using: provider("D", "B", usable: ["D", "B"], ordered: ["D", "B"]))
+        XCTAssertEqual(r.uid, "B"); XCTAssertFalse(r.substituted)
+
         // builtIn + no built-in present → best usable other, substituted
         r = AudioCapture.resolveUID(.builtIn, using: provider("X", nil, usable: ["X"], ordered: ["X"]))
         XCTAssertEqual(r.uid, "X"); XCTAssertTrue(r.substituted)
 
-        // pinned present → as-selected, not substituted
-        r = AudioCapture.resolveUID(.device(uid: "P"), using: provider("D", "B", usable: ["P", "D"], ordered: ["P", "D"]))
-        XCTAssertEqual(r.uid, "P"); XCTAssertFalse(r.substituted)
-
-        // pinned absent, default usable → default, substituted
-        r = AudioCapture.resolveUID(.device(uid: "P"), using: provider("D", "B", usable: ["D", "B"], ordered: ["D", "B"]))
-        XCTAssertEqual(r.uid, "D"); XCTAssertTrue(r.substituted)
-
-        // pinned absent AND default garbage → best usable, substituted
-        r = AudioCapture.resolveUID(.device(uid: "P"), using: provider("D", "B", usable: ["B"], ordered: ["D", "B"]))
-        XCTAssertEqual(r.uid, "B"); XCTAssertTrue(r.substituted)
+        // builtIn + built-in present but unusable (garbage channels) → best usable other, substituted
+        r = AudioCapture.resolveUID(.builtIn, using: provider("X", "B", usable: ["X"], ordered: ["B", "X"]))
+        XCTAssertEqual(r.uid, "X"); XCTAssertTrue(r.substituted)
 
         // nothing usable → nil uid (caller throws noInputDevice rather than capturing a dead device)
         r = AudioCapture.resolveUID(.automatic, using: provider("D", "B", usable: [], ordered: ["D", "B"]))
@@ -370,46 +312,16 @@ final class SessionIsolationTests: XCTestCase {
 final class CrossSessionTests: XCTestCase {
     @MainActor
     func testBackToBackSessionsDoNotLeakOrDrop() async throws {
-        func synth(_ phrase: String, _ name: String) throws -> URL {
-            let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(name)
-            try? FileManager.default.removeItem(at: url)
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/say")
-            p.arguments = ["-o", url.path, phrase]
-            try p.run(); p.waitUntilExit()
-            return url
-        }
-        let a = try synth("the silver wolf howls beneath the moon", "orator-sessA.aiff")
-        let b = try synth("alpha bravo charlie delta echo", "orator-sessB.aiff")
-        try XCTSkipUnless(FileManager.default.fileExists(atPath: a.path), "`say` unavailable")
+        let a = try sayToFile("the silver wolf howls beneath the moon", "orator-sessA.aiff")
+        let b = try sayToFile("alpha bravo charlie delta echo", "orator-sessB.aiff")
+        let engine = try await warmEngine()
 
-        let engine = SpeechEngine(locale: Locale(identifier: "en-US"))
-        let status = await engine.modelStatus()
-        try XCTSkipUnless(status == .installed, "en-US model not installed")
-        try await engine.warmUp()
-        let collector = TranscriptCollector()
-        engine.sink = collector
-        let format = try XCTUnwrap(engine.inputFormat)
-
-        // One dictation against the warm engine, mimicking the coordinator's exact sequence.
-        @MainActor func runSession(_ url: URL) async throws -> String {
-            collector.reset()
-            let capture = FileAudioCapture(url: url, realtime: true)   // wall-clock pace, like a real mic
-            let stream = try capture.start(outputFormat: format)
-            let started = await engine.beginSession()
-            let token = try XCTUnwrap(started)
-            let bridge = Task.detached { [engine] in for await input in stream { engine.feed(input, for: token) } }
-            await bridge.value
-            _ = await engine.finalize(within: .seconds(5))
-            try await Task.sleep(for: .milliseconds(200))   // let late finals land
-            let text = collector.confirmed.lowercased()
-            engine.endSession()                             // tear down, exactly like production
-            return text
-        }
-
+        // `transcribe` IS the coordinator's sequence (start → beginSession → bridge → finalize →
+        // endSession); this test's value is running it repeatedly against one warm engine, not owning
+        // a private copy of the rig. The copy it replaced had drifted to a 200 ms post-finalize sleep.
         for round in 0..<3 {
-            let t1 = try await runSession(a)
-            let t2 = try await runSession(b)
+            let t1 = try await transcribe(a, through: engine)
+            let t2 = try await transcribe(b, through: engine)
             XCTAssertFalse(t1.isEmpty, "round \(round): session A dropped (produced nothing)")
             XCTAssertFalse(t2.isEmpty, "round \(round): session B dropped (produced nothing)")
             // No truncation: the LAST word of each utterance must be present.

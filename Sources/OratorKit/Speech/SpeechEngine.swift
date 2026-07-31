@@ -120,8 +120,22 @@ public final class SpeechEngine {
     /// machine learning models as system dictation features do", i.e. the older lineage, while
     /// SpeechTranscriber is the model shipped for Notes/Voice Memos/Journal. Running the better model
     /// unconditionally IS the product; a vocabulary feature that silently downgrades it is not worth
-    /// having. (Independent LibriSpeech numbers put the new module at 2.12%/4.56% WER against
-    /// 9.02%/16.25% for the legacy one — the gap is large and the biasing gain is not.)
+    /// having.
+    ///
+    /// Measured on our own dictation corpus (2026-07-30), rather than taken on faith:
+    ///
+    ///     A. SpeechTranscriber            WER 0.1919   term recall 1/5   ← shipped
+    ///     B. DictationTranscriber         WER 0.2071   term recall 1/5
+    ///     C. DictationTranscriber + bias  WER 0.2071   term recall 2/5
+    ///     control: SpeechTranscriber + bias  WER 0.1919   term recall 1/5
+    ///
+    /// So the swap costs ~8% relative WER and buys exactly ONE extra vocabulary term out of five —
+    /// the trade this code declines. The control arm is the one that matters for anyone tempted to
+    /// re-add biasing here: passing `contextualStrings` to `SpeechTranscriber` changes nothing at all,
+    /// so the feature genuinely cannot be had without the model downgrade.
+    ///
+    /// Note the real-world gap is far narrower than the third-party LibriSpeech figures this comment
+    /// used to cite (2.12% vs 9.02%). The decision stands, but don't argue it from a 4× claim.
     private func makeSpeechTranscriber() -> SpeechTranscriber {
         // Streaming preset with volatile results for the live preview (ORA-IND-010) and native
         // punctuation preserved (ORA-ASR-007). No etiquette/disfluency stripping (ORA-VOC-004).
@@ -326,7 +340,7 @@ public final class SpeechEngine {
     /// analyzer is finished. Also queues the next spare so the following start is instant.
     public func endSession() { teardown(queueingSpare: true) }
 
-    /// Tear down the active session without queueing a spare (used internally: cancel, rewarm,
+    /// Tear down the active session without queueing a spare (used internally: cancel, locale switch,
     /// shutdown, and the defensive call at the top of `beginSession`).
     private func teardownActive() { teardown(queueingSpare: false) }
 
@@ -373,14 +387,6 @@ public final class SpeechEngine {
         modelReady = false
         inputFormat = nil
         self.locale = locale
-    }
-
-    /// Rebuild for a new locale (a Settings language change) without a relaunch. Throws
-    /// `.modelUnavailable` if that locale's model isn't installed. Only when no session is active.
-    public func rewarm(locale: Locale) async throws {
-        guard locale.identifier != self.locale.identifier else { return }
-        resetWarmState(for: locale)
-        try await warmUp()
     }
 
     /// Switch to `locale`, first triggering the OS model install if it isn't present, then warming —

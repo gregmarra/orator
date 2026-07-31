@@ -15,7 +15,11 @@ import os
 /// same audio IO without that side effect, so the UI keeps working while recording. (Verified by
 /// bisection.)
 private final class CaptureSink: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
-    private let converter: PCMConverter
+    /// Nil in metering mode (Settings level bar): compute RMS from the raw capture buffer and skip the
+    /// analyzer-format conversion + yield entirely — nothing downstream consumes the stream, so the
+    /// per-buffer convert + allocation would be pure waste. "No output format" and "metering" are the
+    /// same fact, so this stands in for the separate flag they used to be.
+    private let converter: PCMConverter?
     private let yield: @Sendable (AnalyzerInput) -> Void
     private let levelBox: OSAllocatedUnfairLock<Float>
     /// Instant of the most recent delivered buffer, for the coordinator's capture watchdog. Stamped
@@ -23,26 +27,21 @@ private final class CaptureSink: NSObject, AVCaptureAudioDataOutputSampleBufferD
     private let lastBufferBox: OSAllocatedUnfairLock<ContinuousClock.Instant?>
     private let hasDeliveredBox: OSAllocatedUnfairLock<Bool>
     private let clipBox: OSAllocatedUnfairLock<ContinuousClock.Instant?>
-    /// Metering-only (Settings level bar): compute RMS from the raw capture buffer and skip the
-    /// analyzer-format conversion + yield entirely — nothing downstream consumes the stream, so the
-    /// per-buffer convert + allocation would be pure waste.
-    private let meteringOnly: Bool
     /// One-shot so a per-buffer failure can't flood the log.
     private var loggedConvertFailure = false
     private var loggedWrapFailure = false
     private var loggedFirstBuffer = false
 
-    init(outputFormat: AVAudioFormat, levelBox: OSAllocatedUnfairLock<Float>,
+    init(outputFormat: AVAudioFormat?, levelBox: OSAllocatedUnfairLock<Float>,
          lastBufferBox: OSAllocatedUnfairLock<ContinuousClock.Instant?>,
          hasDeliveredBox: OSAllocatedUnfairLock<Bool>,
-         clipBox: OSAllocatedUnfairLock<ContinuousClock.Instant?>, meteringOnly: Bool = false,
+         clipBox: OSAllocatedUnfairLock<ContinuousClock.Instant?>,
          yield: @escaping @Sendable (AnalyzerInput) -> Void) {
-        self.converter = PCMConverter(outputFormat: outputFormat)
+        self.converter = outputFormat.map(PCMConverter.init(outputFormat:))
         self.levelBox = levelBox
         self.lastBufferBox = lastBufferBox
         self.hasDeliveredBox = hasDeliveredBox
         self.clipBox = clipBox
-        self.meteringOnly = meteringOnly
         self.yield = yield
     }
 
@@ -68,7 +67,7 @@ private final class CaptureSink: NSObject, AVCaptureAudioDataOutputSampleBufferD
             loggedFirstBuffer = true
             Log.audio.notice("First buffer: format=\(pcm.format, privacy: .public) frames=\(pcm.frameLength) rawRMS=\(PCMConverter.rms(pcm), format: .fixed(precision: 4), privacy: .public)")
         }
-        if meteringOnly {
+        guard let converter else {
             levelBox.withLock { $0 = PCMConverter.rms(pcm) }   // RMS is format-agnostic; no conversion needed
             return
         }
@@ -183,22 +182,24 @@ public final class AudioCapture {
     /// Begin capture for a dictation (`AudioSource` conformance).
     public func start(outputFormat: AVAudioFormat,
                       excluding: Set<String> = []) throws -> AsyncStream<AnalyzerInput> {
-        try beginCapture(outputFormat: outputFormat, meteringOnly: false, excluding: excluding)
+        try beginCapture(outputFormat: outputFormat, excluding: excluding)
     }
 
     /// Begin capture for the Settings level meter: computes RMS from the raw buffer and neither
-    /// converts nor yields, so the returned stream stays empty and needs no consumer.
-    public func startMetering(outputFormat: AVAudioFormat) throws -> AsyncStream<AnalyzerInput> {
-        try beginCapture(outputFormat: outputFormat, meteringOnly: true, excluding: [])
+    /// converts nor yields, so the returned stream stays empty and needs no consumer. Takes no format
+    /// precisely because it needs none — the caller used to invent a dummy 16 kHz one solely to satisfy
+    /// this signature, and it reached nothing but a log field.
+    public func startMetering() throws -> AsyncStream<AnalyzerInput> {
+        try beginCapture(outputFormat: nil, excluding: [])
     }
 
     /// UID of the device currently open, so a failed one can be excluded from a failover retry.
     public private(set) var currentDeviceUID: String?
 
-    /// Begin capture, yielding into a fresh stream. `outputFormat` is the analyzer's input format;
-    /// `meteringOnly` runs the level meter without converting/yielding (Settings preview).
+    /// Begin capture, yielding into a fresh stream. `outputFormat` is the analyzer's input format, or
+    /// nil to run the level meter without converting/yielding (Settings preview).
     /// Returns only after the session has been configured; a throw means stay idle (ORA-SM-004).
-    private func beginCapture(outputFormat: AVAudioFormat, meteringOnly: Bool,
+    private func beginCapture(outputFormat: AVAudioFormat?,
                               excluding: Set<String>) throws -> AsyncStream<AnalyzerInput> {
         guard !running else { throw CaptureError.sessionStartFailed("already running") }
         guard let device = chosenDevice(excluding: excluding) else { throw CaptureError.noInputDevice }
@@ -208,7 +209,7 @@ public final class AudioCapture {
         currentDeviceUID = device.uniqueID
         // The single line that answers "which mic, in what format, converting to what?" — the three
         // facts every silent-capture report needs and none of which were previously recoverable.
-        Log.audio.notice("Capture start: \(device.localizedName, privacy: .public) native=\(AVAudioFormat(cmAudioFormatDescription: device.activeFormat.formatDescription), privacy: .public) target=\(outputFormat, privacy: .public) metering=\(meteringOnly)")
+        Log.audio.notice("Capture start: \(device.localizedName, privacy: .public) native=\(AVAudioFormat(cmAudioFormatDescription: device.activeFormat.formatDescription), privacy: .public) target=\(outputFormat?.description ?? "metering (no conversion)", privacy: .public)")
 
         let (stream, cont) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .unbounded)
         continuation = cont
@@ -218,7 +219,7 @@ public final class AudioCapture {
         hasDeliveredBox.withLock { $0 = false }
         let sink = CaptureSink(outputFormat: outputFormat, levelBox: levelBox,
                                lastBufferBox: lastBufferBox, hasDeliveredBox: hasDeliveredBox,
-                               clipBox: clipBox, meteringOnly: meteringOnly, yield: { cont.yield($0) })
+                               clipBox: clipBox, yield: { cont.yield($0) })
         self.sink = sink
         output.setSampleBufferDelegate(sink, queue: captureQueue)
 
@@ -284,7 +285,7 @@ public final class AudioCapture {
 
     /// The outcome of resolving `MicSelection` to a device, plus whether it's a substitute — so the
     /// Settings readout can show the effective mode instead of silently implying the picked one
-    /// (ORA-CAP-005).
+    /// (ORA-CAP-025).
     struct MicChoice: Sendable {
         let device: AVCaptureDevice?
         /// True when the resolved device is a *substitute* for the selection (pinned mic absent, garbage
@@ -336,8 +337,6 @@ public final class AudioCapture {
         return MicChoice(device: dev, substituted: substituted)
     }
 
-    static func resolveDevice() -> AVCaptureDevice? { resolveChoice().device }
-
     /// PURE selection decision over an injected `DeviceProvider` — no hardware, no AVCaptureDevice
     /// materialization — so every fallback/substitution branch is headlessly testable (ORA-CAP-012).
     /// `substituted` is true when the returned UID isn't the one the selection asked for. Returns nil
@@ -358,12 +357,6 @@ public final class AudioCapture {
         case .builtIn:
             if let uid = p.builtInUID(), usable(uid) { return (uid, false) }
             return (bestUsableUID(using: p, usable: usable), true)   // no built-in → substitute (nil if nothing usable)
-        case .device(let pinned):
-            // Sticky pin: use it when present AND usable; when replugged it satisfies this again, so
-            // the preference re-engages with no relatch.
-            if usable(pinned) { return (pinned, false) }
-            // Absent/unusable pin → system default (itself possibly a further substitute).
-            return (automaticUID(using: p, usable: usable).uid, true)
         }
     }
 
@@ -383,18 +376,10 @@ public final class AudioCapture {
         return p.orderedInputUIDs().first(where: usable)
     }
 
-    /// Materialized best-usable input: the terminal fallback the resolver would land on, as a real
-    /// device. Nil when nothing is usable. (Also the seam the headless usability test asserts against.)
-    static func bestUsableInput() -> AVCaptureDevice? {
-        let live = DeviceProvider.live
-        guard let uid = bestUsableUID(using: live, usable: live.isUsable) else { return nil }
-        return AVCaptureDevice(uniqueID: uid)
-    }
-
     /// The built-in input UID, memoized — INCLUDING the negative result, so a Mac with no built-in
     /// transport doesn't re-enumerate on every record start (ORA-CAP-007). A cached *positive* self-
-    /// heals via the O(1) `isUsableInput` check; the cache is dropped on a Core Audio device change
-    /// (`invalidateBuiltInCache`, called by AudioDeviceList) so a stale UID can't stick.
+    /// heals via the O(1) `isUsableInput` check; the cache is dropped on a Core Audio device change by
+    /// the process-lifetime listener installed below, so a stale UID can't stick.
     private enum BuiltInCache { case unknown, resolved(String?) }
     private static var builtInCache: BuiltInCache = .unknown
     static func cachedBuiltInInputUID() -> String? {
@@ -411,19 +396,17 @@ public final class AudioCapture {
         builtInCache = .resolved(uid)
         return uid
     }
-    /// Drop the memoized built-in UID (call on a Core Audio device topology change).
-    static func invalidateBuiltInCache() { builtInCache = .unknown }
-
-    /// A single PROCESS-lifetime device-change listener that invalidates the built-in cache, so the
-    /// NEGATIVE memo re-probes when a built-in mic reappears (clamshell/undock/replug) even with
-    /// Settings closed (ORA-CAP-024). AudioDeviceList's own invalidation only runs while Settings is
-    /// open, which would otherwise leave `.builtIn` mode stuck at "no built-in" indefinitely.
+    /// A single PROCESS-lifetime device-change listener that drops the memoized UID, so the NEGATIVE
+    /// memo re-probes when a built-in mic reappears (clamshell/undock/replug) even with Settings
+    /// closed (ORA-CAP-024) — otherwise `.builtIn` mode stays stuck at "no built-in" indefinitely.
+    /// This is the ONLY invalidator, and it must stay process-lifetime: the Settings meter's own
+    /// device-change listeners are registered only while that window is open and metering.
     private static var invalidationListenerInstalled = false
     private static func installBuiltInInvalidationListenerIfNeeded() {
         guard !invalidationListenerInstalled else { return }
         invalidationListenerInstalled = true
         let (_, status) = CoreAudioSupport.addSystemListener(kAudioHardwarePropertyDevices) { _, _ in
-            MainActor.assumeIsolated { AudioCapture.invalidateBuiltInCache() }
+            MainActor.assumeIsolated { AudioCapture.builtInCache = .unknown }
         }
         if status != noErr { Log.audio.error("Built-in cache listener registration failed: \(status)") }
     }

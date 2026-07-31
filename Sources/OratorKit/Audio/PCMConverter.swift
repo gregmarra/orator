@@ -10,8 +10,10 @@ private final class ConsumeOnce: @unchecked Sendable { var done = false }
 /// **Why the status check is `!= .error`, not `== .haveData`:** feeding one buffer at a time, the
 /// converter consumes that whole buffer, produces valid downsampled output, and *then* reports
 /// `.inputRanDry` (no more input queued) — NOT `.haveData`. Gating on `.haveData` alone discards
-/// every buffer, silently killing capture (no level, no analyzer input, no transcript). Verified by
-/// `testConverterReportsInputRanDryYetProducesFrames`.
+/// every buffer, silently killing capture (no level, no analyzer input, no transcript). Guarded by
+/// `PCMConverterDownmixTests.testAllStereoLayoutsDownmixToAudibleMono`, which drives THIS converter
+/// and fails if the status check is tightened — unlike the test that used to be named here, which
+/// built its own `AVAudioConverter` and so could not detect a change to this file at all.
 final class PCMConverter {
     private let outputFormat: AVAudioFormat
     private var converter: AVAudioConverter?

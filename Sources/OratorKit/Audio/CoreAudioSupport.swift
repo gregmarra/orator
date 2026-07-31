@@ -19,7 +19,7 @@ enum CoreAudioSupport {
 
     /// Every input device with at least one real input channel (garbage inputs — devices that expose
     /// no capturable channels — are dropped). O(devices) CoreAudio IPC + per-device name/CFString
-    /// lookups; keep this off the hotkey→capture path (see the AudioDeviceList model / hot-path memory).
+    /// lookups; keep this off the hotkey→capture path (that path resolves its device in O(1)).
     static func inputDeviceList() -> [InputDevice] {
         deviceIDs().compactMap { dev -> InputDevice? in
             guard hasInputChannels(dev), let uid = deviceUID(dev) else { return nil }

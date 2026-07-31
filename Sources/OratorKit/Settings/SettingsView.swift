@@ -8,7 +8,6 @@ public struct SettingsView: View {
     @State private var hotkey: HotkeyChord = Settings.shared.hotkey
     @State private var micSelection: MicSelection = Settings.shared.micSelection
     /// Live list of input devices; refreshes as mics are plugged/unplugged while Settings is open.
-    @State private var deviceList = AudioDeviceList()
     /// Live input-level meter for the selected device (Settings-only; released on disappear).
     @State private var meter = MicLevelMonitor()
     @State private var launchAtLogin: Bool = LaunchAtLogin.isEnabled
@@ -74,17 +73,11 @@ public struct SettingsView: View {
         .frame(width: 420)
         .fixedSize(horizontal: false, vertical: true)
         .task { await language.reload?() }   // read supported/installed locales dynamically on open
-        .onAppear { deviceList.start(); syncMeter() }     // live mic list while open; meter gated on active
-        .onDisappear { deviceList.stop(); meter.stop() }
+        .onAppear { syncMeter() }
+        .onDisappear { meter.stop() }
         // Only meter while this window is frontmost — pause when the user switches away or is dictating
         // into another app (so the mic isn't held, and we don't run a second session on it).
         .onChange(of: controlActiveState) { _, _ in syncMeter() }
-        // Re-meter the resolved device when the system default or the set of present devices changes
-        // (e.g. a pinned mic is unplugged → readout switches to the fallback). Gate on active state so
-        // a background device change can't re-acquire the mic while the window is inactive — the
-        // meter's own no-op guard doesn't cover the stopped case (ORA-CAP-020).
-        .onChange(of: deviceList.defaultUID) { _, _ in if controlActiveState != .inactive { meter.restart() } }
-        .onChange(of: deviceList.devices) { _, _ in if controlActiveState != .inactive { meter.restart() } }
     }
 
     /// Run the meter only while the window is active; stop it (releasing the mic) otherwise.
@@ -92,9 +85,9 @@ public struct SettingsView: View {
         if controlActiveState == .inactive { meter.stop() } else { meter.start() }
     }
 
-    /// Microphone picker: "Automatic" (follow system default), a pinned "Built-in", or any specific
-    /// present device. A pinned device is sticky — selecting one stores its UID, and `AudioCapture`
-    /// falls back to the default when it's absent and re-engages it when it returns.
+    /// Microphone picker: "Automatic" (follow the system default) or a pinned "Built-in" — those two
+    /// only (ORA-CAP-002). A user whose preferred mic isn't the system default changes it in System
+    /// Settings, where that choice already lives.
     @ViewBuilder private var micRow: some View {
         // Picker + level bar + status as ONE Form row, so no divider (horizontal rule) separates the
         // bar from the picker it belongs to.
@@ -102,18 +95,6 @@ public struct SettingsView: View {
         Picker("Microphone", selection: $micSelection) {
             Text("Automatic (system default)").tag(MicSelection.automatic)
             Text("Built-in microphone").tag(MicSelection.builtIn)
-            if !deviceList.devices.isEmpty { Divider() }
-            ForEach(deviceList.devices) { d in
-                Text(rowLabel(for: d)).tag(MicSelection.device(uid: d.uid))
-            }
-            // A pinned device that isn't currently plugged in: keep a row so the selection stays
-            // visible — by its last-known name when we have one — rather than showing a blank picker.
-            if case .device(let uid) = micSelection,
-               !deviceList.devices.contains(where: { $0.uid == uid }) {
-                let name = Settings.shared.rememberedDeviceName(for: uid)
-                Text(name.map { "\($0) (unavailable)" } ?? "Selected microphone (unavailable)")
-                    .tag(MicSelection.device(uid: uid))
-            }
         }
         .onChange(of: micSelection) { _, v in
             Settings.shared.micSelection = v
@@ -133,11 +114,6 @@ public struct SettingsView: View {
         }
     }
 
-    /// Picker row label — the decision itself lives in `MicStatus` so it is unit-testable.
-    private func rowLabel(for d: CoreAudioSupport.InputDevice) -> String {
-        MicStatus.rowLabel(for: d, among: deviceList.devices, defaultUID: deviceList.defaultUID)
-    }
-
     /// Compact status under the level bar: the *effective* mode + resolved device, e.g.
     /// "Automatic (MacBook Air Microphone)". Middle-truncates when it doesn't fit, so both the mode and
     /// the tail of the device name stay visible. Also covers the can't-open and no-device states.
@@ -152,15 +128,12 @@ public struct SettingsView: View {
 
     /// Status line — the decision itself lives in `MicStatus` so it is unit-testable.
     private var micStatusText: String {
-        // Prefer the picker's (Core Audio) name so the list and status agree.
-        let liveName = meter.resolvedUID.flatMap { uid in deviceList.devices.first { $0.uid == uid }?.name }
-        return MicStatus.text(permissionDenied: meter.permissionDenied,
-                              openFailure: meter.openFailure,
-                              liveName: liveName,
-                              resolvedName: meter.resolvedName,
-                              selection: micSelection,
-                              substituted: meter.substituted,
-                              clipping: meter.clipping)
+        MicStatus.text(permissionDenied: meter.permissionDenied,
+                       openFailure: meter.openFailure,
+                       resolvedName: meter.resolvedName,
+                       selection: micSelection,
+                       substituted: meter.substituted,
+                       clipping: meter.clipping)
     }
 
     /// Language picker built from the transcriber's supported locales (dynamic). Selecting a language
