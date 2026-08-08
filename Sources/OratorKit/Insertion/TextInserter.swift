@@ -51,16 +51,22 @@ public final class TextInserter {
             return .deferredToRecovery(.focusChanged)
         }
 
-        // 2. Inspect the focused element (needs Accessibility). Without it we cannot verify the
-        //    target is safe/editable, so route to recovery (E2) rather than risk a wrong paste.
+        // 2. Without Accessibility there is no insertion at all: the synthetic ⌘V is a CGEvent, and the
+        //    system refuses to deliver those from an untrusted process — so the paste could not land even
+        //    if we tried it. That is why this bails where a merely-unreadable field does not (E2 vs E16).
         guard accessibilityGranted else {
             return .deferredToRecovery(.accessibilityMissing)
         }
         // Resolve the focused element ONCE and reuse it for every check + the paste verification —
         // each `AXUIElementCopyAttributeValue` is a cross-process call with real main-thread cost.
-        guard let element = focusedElement() else {
-            return .deferredToRecovery(.noTarget)
-        }
+        //
+        // A nil element is NOT a reason to give up (ORA-INS-003 / E16). Some Chromium/CEF hosts
+        // publish no accessibility tree at all — measured on the Steam client, where the focused
+        // element is nil even with the caret sitting in the store search box with text in it, and
+        // neither AXManualAccessibility (unsupported) nor AXEnhancedUserInterface (not implemented)
+        // will turn one on. ⌘V still reaches the app through the responder chain, so we paste blind:
+        // no context refinement, no verification, but dictation works there at all.
+        let element = focusedElement()
         if isSecureField(element) {
             return .deferredToRecovery(.secureField)          // ORA-INS-007 / E9
         }
@@ -90,8 +96,9 @@ public final class TextInserter {
     /// `AXStringForRange` — WhatsApp is exactly this shape: `hasValue=false`, `hasRange=true`.
     /// Reading the whole value therefore failed in apps where the context was perfectly obtainable,
     /// and every dictation there got capitalized as a new sentence. Falls back to the full value for
-    /// fields that answer that instead.
-    private func precedingText(_ element: AXUIElement) -> String? {
+    /// fields that answer that instead, and nil for a nil element (E16) — which callers already treat as
+    /// standalone text.
+    private func precedingText(_ element: AXUIElement?) -> String? {
         guard let caret = caretLocation(element) else { return copyString(element, kAXValueAttribute) }
         guard caret > 0 else { return "" }                    // caret at the very start ⇒ empty context
         let start = max(0, caret - Self.contextWindow)
@@ -104,7 +111,8 @@ public final class TextInserter {
     }
 
     /// Caret offset (UTF-16) within the focused element, if it reports one.
-    private func caretLocation(_ element: AXUIElement) -> Int? {
+    private func caretLocation(_ element: AXUIElement?) -> Int? {
+        guard let element else { return nil }
         var rangeRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
               let axRange = rangeRef, CFGetTypeID(axRange) == AXValueGetTypeID() else { return nil }
@@ -114,7 +122,8 @@ public final class TextInserter {
     }
 
     /// `AXStringForRange` — the parameterized read that works where `kAXValue` is refused.
-    private func stringForRange(_ element: AXUIElement, location: Int, length: Int) -> String? {
+    private func stringForRange(_ element: AXUIElement?, location: Int, length: Int) -> String? {
+        guard let element else { return nil }
         guard length > 0 else { return "" }
         var range = CFRange(location: location, length: length)
         guard let parameter = AXValueCreate(.cfRange, &range) else { return nil }
@@ -140,14 +149,21 @@ public final class TextInserter {
     /// else focused is treated as editable: paste is the real test (browser/web-view fields often don't
     /// advertise settable AX attributes yet still accept ⌘V), and the recovery buffer is the safety net
     /// if it lands nowhere (M4).
-    private func isSecureField(_ axElement: AXUIElement) -> Bool {
+    private func isSecureField(_ axElement: AXUIElement?) -> Bool {
         // True when the focused field advertises the AXSecureTextField subrole, or when secure input is
         // engaged globally (e.g. a password prompt open elsewhere, E10). Both refuse programmatic paste.
+        // With no element the subrole read yields nil, leaving global secure input as the only surviving
+        // signal — a narrowing ORA-INS-007 sanctions explicitly, along with the risk it accepts.
         copyString(axElement, kAXSubroleAttribute) == (kAXSecureTextFieldSubrole as String)
             || SecureInput.isGloballyActive
     }
 
-    private func copyString(_ element: AXUIElement, _ attr: String) -> String? {
+    /// The three AX leaf readers all take an OPTIONAL element and answer nil for a nil one, so "the host
+    /// publishes no accessibility tree" (E16) collapses into the same "this field won't tell us" answer
+    /// every caller already handles. Keeping the nil check here rather than in each consumer is what lets
+    /// `precedingText`, `isSecureField`, and `paste` stay written as though an element always existed.
+    private func copyString(_ element: AXUIElement?, _ attr: String) -> String? {
+        guard let element else { return nil }
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, attr as CFString, &value) == .success else { return nil }
         return value as? String
@@ -155,7 +171,7 @@ public final class TextInserter {
 
     // MARK: Paste
 
-    private func paste(_ text: String, settle: Duration?, element: AXUIElement) async -> InsertionOutcome {
+    private func paste(_ text: String, settle: Duration?, element: AXUIElement?) async -> InsertionOutcome {
         let preValue = copyString(element, kAXValueAttribute)   // for best-effort verification
         let snapshot = Pasteboard.snapshot()
         let ourChangeCount = Pasteboard.writeConcealed(text)
@@ -193,8 +209,10 @@ public final class TextInserter {
     /// selection at least as long as the new text leaves the length equal or smaller. A
     /// length-must-grow test reports those perfectly good pastes as rejected — and re-dictating over
     /// selected text is a normal workflow, not an edge case.
-    private func awaitPasteConsumed(preValue: String?, element: AXUIElement) async -> Bool {
-        guard let preValue else { return false }      // not verifiable ⇒ caller uses the safety delay
+    private func awaitPasteConsumed(preValue: String?, element: AXUIElement?) async -> Bool {
+        // Not verifiable ⇒ caller uses the safety delay. Covers a nil element too (E16): `preValue` is
+        // read from that same element, so it is already nil whenever the element is.
+        guard let preValue else { return false }
         let deadline = ContinuousClock.now.advanced(by: .milliseconds(800))
         while ContinuousClock.now < deadline {
             if let now = copyString(element, kAXValueAttribute), now != preValue { return true }
