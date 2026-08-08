@@ -447,6 +447,10 @@ Invariants (all MUST):
   Accessibility is used **only** to locate the focused element, detect secure fields (ORA-INS-007), confirm the
   frontmost app (ORA-INS-002), and best-effort *verify* the paste landed (by observing the focused value grow)
   — **not** to write text. Rationale: one insertion code path is the "boring to maintain" choice (Principle 6).
+  When the focused element cannot be resolved **at all**, Orator MUST still paste — unverified — rather than
+  route the result to the recovery buffer (E16). Rationale: some hosts publish no accessibility tree whatsoever,
+  yet the keystroke still reaches them through the responder chain, so refusing would make dictation permanently
+  impossible there while attempting it costs only a verification the host was never going to answer.
 - ORA-INS-004 (SHOULD): The paste keystroke SHOULD be posted with the Command modifier using the key code that
   types "v" in the **current keyboard layout** (resolved from the active Unicode keyboard layout), so paste
   works on non-QWERTY layouts (Dvorak, AZERTY, …); it MUST fall back to the ANSI-V physical key code when the
@@ -465,6 +469,10 @@ Invariants (all MUST):
   minimal built-in lookup, not a user-facing configuration system.
 - ORA-INS-007 (MUST NOT): Orator MUST NOT insert into a secure text field (password fields refuse programmatic
   input); it MUST detect this case and route the result to the recovery buffer with a legible reason.
+  Detection uses two independent signals: the focused element's `AXSecureTextField` subrole, and globally-active
+  secure input (`IsSecureEventInputEnabled`). When the host exposes no focused element (ORA-INS-003) the subrole
+  is unreadable and only the second signal survives; Orator MUST still honor it. Detection is therefore
+  best-effort in that case, with the residual risk recorded as R13.
 - ORA-INS-008 (SHOULD): When the caret sits immediately after a non-whitespace character, Orator SHOULD prepend
   a single separating space to the inserted text so back-to-back dictations into the same field do not run
   together. This is best-effort: it reads the field value and caret offset via Accessibility and does nothing
@@ -757,6 +765,7 @@ The state machine is §7.2; the user-facing sequence:
 | E13 | User copies during deferred restore | Do not clobber the newer clipboard (changeCount guard). (ORA-INS-005) |
 | E14 | Very long dictation (approaching cap) | Auto-stop at ~30 min as a normal stop; text preserved. (ORA-SM-010) |
 | E15 | Paste verify fails (focused value did not grow) | Route the result to the recovery buffer with a legible reason. (ORA-INS-003) |
+| E16 | Host publishes no accessibility tree, so there is no focused element | Paste anyway, unverified; only global secure input can veto. (ORA-INS-003) |
 
 ---
 
@@ -775,6 +784,7 @@ The state machine is §7.2; the user-facing sequence:
 | R10 | “Memory-only” recovery buffer can still page to swap; copy path re-exposes text. | Medium | Low–Med | Describe honestly as “not persisted by the app”; conceal the copy path; short TTL. |
 | R11 | Permissions onboarding is certain friction; stale grants after reinstall are a known trap. | Certain | Medium | Detect + deep-link each pane; re-check on focus; stable Developer ID signing to keep TCC grants stable across rebuilds. |
 | R12 | **`AVAudioEngine` corrupts the Swift main-actor executor** on macOS 26 / Swift 6, crashing the app when any SwiftUI view is shown after audio init (mechanism in ORA-CAP-001). | Certain (this toolchain) | Critical | Capture via `AVCaptureSession` + `AVCaptureAudioDataOutput` (does not corrupt the executor); convert `CMSampleBuffer` → `AVAudioPCMBuffer` → analyzer format (ORA-CAP-001). |
+| R13 | Pasting into a host that exposes no focused element (ORA-INS-003) cannot check the `AXSecureTextField` subrole, so a web-view password field that does not engage global secure input could receive dictated text. | Low | Low–Med | Accepted. Global secure input still vetoes the paste; the text is the user's own dictation going where their own caret already was; the result stays retrievable in the recovery buffer. The alternative — refusing to dictate into such hosts at all — was judged the worse failure. |
 
 ---
 
