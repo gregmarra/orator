@@ -45,8 +45,8 @@ public final class MicLevelMonitor {
     // into one "the user is present" flag because they genuinely disagree: at the lock screen the
     // display is awake while the app is not active, and one flag would let the display waking
     // re-acquire the microphone behind the lock.
-    ///
-    /// Settings is open — the delegate's answer, set by `start`/`stop`.
+    //
+    // `settingsOpen` is the delegate's answer, set by `start`/`stop`.
     @ObservationIgnored private var settingsOpen = false
     @ObservationIgnored private var appActive = true
     @ObservationIgnored private var screensAwake = true
