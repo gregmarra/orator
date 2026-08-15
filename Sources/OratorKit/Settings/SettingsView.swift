@@ -7,16 +7,13 @@ import Carbon.HIToolbox
 public struct SettingsView: View {
     @State private var hotkey: HotkeyChord = Settings.shared.hotkey
     @State private var micSelection: MicSelection = Settings.shared.micSelection
-    /// Live list of input devices; refreshes as mics are plugged/unplugged while Settings is open.
-    /// Live input-level meter for the selected device (Settings-only; released on disappear).
-    @State private var meter = MicLevelMonitor()
+    /// Live input-level meter for the selected device — READ here, owned by `AppDelegate`. This view
+    /// never starts or stops it: a view is not something the microphone's release can depend on
+    /// (ORA-CAP-026).
+    private let meter: MicLevelMonitor
     @State private var launchAtLogin: Bool = LaunchAtLogin.isEnabled
     @State private var soundEnabled: Bool = Settings.shared.soundEnabled
     @State private var recordingHotkey = false
-    /// Whether this window is the active/key window. The meter holds the microphone (orange indicator,
-    /// battery, and a second session on the same device a recording might use), so we only run it while
-    /// Settings is the frontmost window and pause it otherwise (ORA-CAP-010).
-    @Environment(\.controlActiveState) private var controlActiveState
     @Bindable private var language: LanguageModel
     /// A not-yet-installed language the user picked, awaiting download confirmation.
     @State private var pendingInstallID: String?
@@ -30,10 +27,12 @@ public struct SettingsView: View {
     public var onReset: (() -> Void)?
 
     public init(language: LanguageModel,
+                meter: MicLevelMonitor,
                 onHotkeyChange: ((HotkeyChord) -> Void)? = nil,
                 onHotkeyRecording: ((Bool) -> Void)? = nil,
                 onReset: (() -> Void)? = nil) {
         self._language = Bindable(language)
+        self.meter = meter
         self.onHotkeyChange = onHotkeyChange
         self.onHotkeyRecording = onHotkeyRecording
         self.onReset = onReset
@@ -73,16 +72,11 @@ public struct SettingsView: View {
         .frame(width: 420)
         .fixedSize(horizontal: false, vertical: true)
         .task { await language.reload?() }   // read supported/installed locales dynamically on open
-        .onAppear { syncMeter() }
-        .onDisappear { meter.stop() }
-        // Only meter while this window is frontmost — pause when the user switches away or is dictating
-        // into another app (so the mic isn't held, and we don't run a second session on it).
-        .onChange(of: controlActiveState) { _, _ in syncMeter() }
-    }
-
-    /// Run the meter only while the window is active; stop it (releasing the mic) otherwise.
-    private func syncMeter() {
-        if controlActiveState == .inactive { meter.stop() } else { meter.start() }
+        // No mic lifecycle here on purpose: this view only *reads* the meter. Its acquisition is tied
+        // to the Settings window in `AppDelegate`, and pausing while the user is away is the monitor's
+        // own job (ORA-CAP-026) — the `controlActiveState` gate that used to live here was a second,
+        // weaker copy of the monitor's app-active handling, and it was the copy that had no answer for
+        // a display going to sleep.
     }
 
     /// Microphone picker: "Automatic" (follow the system default) or a pinned "Built-in" — those two

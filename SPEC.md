@@ -370,6 +370,14 @@ Invariants (all MUST):
 - ORA-CAP-010 (MUST): The Settings level meter MUST run only while the Settings window is frontmost, and MUST
   release the microphone otherwise — it may never hold the input device in the background, nor open a second
   session on a device that is being dictated into.
+- ORA-CAP-026 (MUST): Every path that holds the microphone MUST have a release trigger that does not depend
+  on SwiftUI view lifecycle, and MUST log both acquisition and release, naming which capture it is. *Rationale:
+  the Settings meter's only stop hooks were `onDisappear` and `controlActiveState` on a view hosted in a window
+  created with `isReleasedWhenClosed = false`. Neither fires when the display sleeps, the machine sleeps, or the
+  screen locks with Settings frontmost, and the meter had no owner outside that view — so Orator kept the
+  microphone (and the system's orange in-use indicator) until the user quit it, with no log record of what was
+  holding it. Releasing MUST also detach the capture input, not merely stop the session: the system's in-use
+  indicator follows the open device.*
 - ORA-CAP-008 (SHOULD): Re-resolving that meter MUST be a no-op when the resolved device is unchanged, so
   plug/unplug bursts and redundant change notifications don't needlessly tear down and rebuild a capture
   session.

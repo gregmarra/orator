@@ -115,6 +115,11 @@ public final class AudioCapture {
         }
     }
 
+    /// Which capture this is — `dictation` (the coordinator's) or `meter` (the Settings level bar).
+    /// Two independent `AVCaptureSession`s can hold the microphone, and until this existed the log
+    /// recorded starts with no way to tell them apart and no record of stops at all — so a microphone
+    /// left held after the user walked away was undiagnosable after the fact (ORA-CAP-026).
+    private let label: String
     private let session = AVCaptureSession()
     private let output = AVCaptureAudioDataOutput()
     private let captureQueue = DispatchQueue(label: "com.grgmrr.orator.capture")
@@ -177,7 +182,9 @@ public final class AudioCapture {
         AVNumberOfChannelsKey: 1,
     ]
 
-    public init() {}
+    /// `label` is required, not defaulted: a default would let a third capture appear in the log
+    /// wearing the name of an existing one, which is the exact confusion it exists to prevent.
+    public init(label: String) { self.label = label }
 
     /// Begin capture for a dictation (`AudioSource` conformance).
     public func start(outputFormat: AVAudioFormat,
@@ -209,7 +216,7 @@ public final class AudioCapture {
         currentDeviceUID = device.uniqueID
         // The single line that answers "which mic, in what format, converting to what?" — the three
         // facts every silent-capture report needs and none of which were previously recoverable.
-        Log.audio.notice("Capture start: \(device.localizedName, privacy: .public) native=\(AVAudioFormat(cmAudioFormatDescription: device.activeFormat.formatDescription), privacy: .public) target=\(outputFormat?.description ?? "metering (no conversion)", privacy: .public)")
+        Log.audio.notice("Capture start [\(self.label, privacy: .public)]: \(device.localizedName, privacy: .public) native=\(AVAudioFormat(cmAudioFormatDescription: device.activeFormat.formatDescription), privacy: .public) target=\(outputFormat?.description ?? "metering (no conversion)", privacy: .public)")
 
         let (stream, cont) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .unbounded)
         continuation = cont
@@ -268,10 +275,22 @@ public final class AudioCapture {
     public func stop() {
         guard running else { return }
         running = false
+        Log.audio.notice("Capture stop [\(self.label, privacy: .public)]: releasing the microphone")
         if let obs = runtimeErrorObserver { NotificationCenter.default.removeObserver(obs); runtimeErrorObserver = nil }
         output.setSampleBufferDelegate(nil, queue: nil)
         nonisolated(unsafe) let captureSession = session
-        sessionQueue.async { captureSession.stopRunning() }   // serialized with config/start (ORA-CAP-004)
+        sessionQueue.async {                                  // serialized with config/start (ORA-CAP-004)
+            captureSession.stopRunning()
+            // DETACH the input too, don't just stop. A stopped session that still holds an
+            // `AVCaptureDeviceInput` keeps the device open, and the system's mic-in-use indicator
+            // follows the open device — not our notion of "recording". The input used to be removed
+            // only at the *next* start, so between dictations Orator sat there holding the microphone
+            // with nothing on screen to explain it (ORA-CAP-026). `beginCapture` re-adds it, so this
+            // costs one reconfiguration on a path that is already off the hot path.
+            captureSession.beginConfiguration()
+            captureSession.inputs.forEach { captureSession.removeInput($0) }
+            captureSession.commitConfiguration()
+        }
         continuation?.finish()
         continuation = nil
         sink = nil

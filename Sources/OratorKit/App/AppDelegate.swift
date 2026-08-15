@@ -12,7 +12,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
     private let feedback = SoundFeedback()
     private let recovery = RecoveryBuffer()
     private let inserter = TextInserter()
-    private let audio = AudioCapture()
+    private let audio = AudioCapture(label: "dictation")
     private lazy var engine = SpeechEngine(locale: Settings.shared.locale)
     private lazy var coordinator = SessionCoordinator(
         audio: audio, engine: engine, inserter: inserter,
@@ -26,6 +26,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     private var settingsWindow: NSWindow?
     private var onboardingWindow: NSWindow?
+    /// The Settings level meter. Owned HERE rather than by the SwiftUI view so that closing the
+    /// window — the one event a view living in a never-released window can miss — definitively
+    /// releases the microphone (ORA-CAP-010 / ORA-CAP-026).
+    private let meter = MicLevelMonitor()
     private let onboarding = OnboardingModel()
     private lazy var language = LanguageModel(selectedID: Settings.shared.localeIdentifier)
 
@@ -290,9 +294,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     private func presentSettings() {
         promoteToRegular()
+        // The meter's lifetime IS the Settings window's lifetime, and both ends of it live here —
+        // opposite `windowWillClose` — rather than in the hosted view, which cannot be relied on to
+        // hear about its own window closing (ORA-CAP-010 / ORA-CAP-026).
+        meter.start()
         if let w = settingsWindow { bringUpFront(w); return }
         let view = SettingsView(
             language: language,
+            meter: meter,
             onHotkeyChange: { [weak self] chord in self?.hotkey.register(chord) },
             onHotkeyRecording: { [weak self] active in
                 // Suspend the global hotkey while recording so pressing the current combo reaches the
@@ -333,6 +342,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     /// When our last window closes, drop back to a menu-bar agent (no Dock icon).
     public func windowWillClose(_ notification: Notification) {
+        // Closing Settings releases the microphone. This is the release, not a backstop for one: the
+        // window is created with `isReleasedWhenClosed = false` and cached forever, so its hosted view
+        // can outlive the close without SwiftUI ever telling it (ORA-CAP-010).
+        if (notification.object as? NSWindow) === settingsWindow { meter.stop() }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             let anyVisible = (self.settingsWindow?.isVisible ?? false) || (self.onboardingWindow?.isVisible ?? false)
