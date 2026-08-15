@@ -12,7 +12,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
     private let feedback = SoundFeedback()
     private let recovery = RecoveryBuffer()
     private let inserter = TextInserter()
-    private let audio = AudioCapture()
+    private let audio = AudioCapture(label: "dictation")
     private lazy var engine = SpeechEngine(locale: Settings.shared.locale)
     private lazy var coordinator = SessionCoordinator(
         audio: audio, engine: engine, inserter: inserter,

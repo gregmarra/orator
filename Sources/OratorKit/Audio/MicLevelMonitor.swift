@@ -32,7 +32,7 @@ final class MicLevelMonitor {
     /// no downstream setting recovers it — the only fix is lowering the gain, so it has to be visible.
     private(set) var clipping = false
 
-    @ObservationIgnored private let capture = AudioCapture()
+    @ObservationIgnored private let capture = AudioCapture(label: "meter")
     @ObservationIgnored private var poll: Task<Void, Never>?
     @ObservationIgnored private var running = false
 
