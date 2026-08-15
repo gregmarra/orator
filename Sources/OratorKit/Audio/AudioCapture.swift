@@ -279,7 +279,18 @@ public final class AudioCapture {
         if let obs = runtimeErrorObserver { NotificationCenter.default.removeObserver(obs); runtimeErrorObserver = nil }
         output.setSampleBufferDelegate(nil, queue: nil)
         nonisolated(unsafe) let captureSession = session
-        sessionQueue.async { captureSession.stopRunning() }   // serialized with config/start (ORA-CAP-004)
+        sessionQueue.async {                                  // serialized with config/start (ORA-CAP-004)
+            captureSession.stopRunning()
+            // DETACH the input too, don't just stop. A stopped session that still holds an
+            // `AVCaptureDeviceInput` keeps the device open, and the system's mic-in-use indicator
+            // follows the open device — not our notion of "recording". The input used to be removed
+            // only at the *next* start, so between dictations Orator sat there holding the microphone
+            // with nothing on screen to explain it (ORA-CAP-026). `beginCapture` re-adds it, so this
+            // costs one reconfiguration on a path that is already off the hot path.
+            captureSession.beginConfiguration()
+            captureSession.inputs.forEach { captureSession.removeInput($0) }
+            captureSession.commitConfiguration()
+        }
         continuation?.finish()
         continuation = nil
         sink = nil
