@@ -58,9 +58,9 @@ public final class MicLevelMonitor {
     /// has decided we shouldn't be holding it.
     @ObservationIgnored
     private var registered: [(AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
-    @ObservationIgnored private var restartPending = false
-    /// Bumped on teardown so an in-flight debounced restart from a previous session no-ops.
-    @ObservationIgnored private var restartGeneration = 0
+    /// The pending debounced restart, if any — non-nil IS "a restart is already scheduled", and
+    /// cancelling it is what stops one from a previous session landing on this one.
+    @ObservationIgnored private var restartTask: Task<Void, Never>?
 
     public init() {}
 
@@ -203,23 +203,19 @@ public final class MicLevelMonitor {
                                                    DispatchQueue.main, block)
         }
         registered.removeAll()
-        restartGeneration &+= 1   // cancel any pending debounced restart from this session
-        restartPending = false
+        restartTask?.cancel(); restartTask = nil   // drop a debounced restart from this session
     }
 
     /// Coalesce a burst of change callbacks (docks/hubs re-registering) into one restart, and — the
     /// load-bearing part — get off the Core Audio callback before tearing the capture session down,
     /// since `restart()` removes the very listener block that is currently executing.
     private func scheduleRestart() {
-        guard !restartPending else { return }
-        restartPending = true
-        let gen = restartGeneration
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            MainActor.assumeIsolated {
-                guard let self, gen == self.restartGeneration else { return }
-                self.restartPending = false
-                self.restart()
-            }
+        guard restartTask == nil else { return }   // one pending restart per burst
+        restartTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled, let self else { return }
+            self.restartTask = nil                 // cleared first: `restart` tears the listeners down,
+            self.restart()                         // and that path cancels whatever is pending
         }
     }
 
