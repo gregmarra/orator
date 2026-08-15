@@ -255,8 +255,9 @@ public final class AudioCapture {
         nonisolated(unsafe) let captureOutput = output
         nonisolated(unsafe) let addedInput = input
         sessionQueue.async {
+            // No input to remove first: `stop` detaches, `running` gates re-entry, and both run on
+            // this same serial queue — so the session always arrives here empty.
             captureSession.beginConfiguration()
-            captureSession.inputs.forEach { captureSession.removeInput($0) }
             if captureSession.canAddInput(addedInput) { captureSession.addInput(addedInput) }
             else { Log.audio.error("Cannot add microphone input") }
             if !captureSession.outputs.contains(captureOutput) {
