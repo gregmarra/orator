@@ -16,8 +16,16 @@
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
+    <!-- Build fingerprint. CFBundleVersion and the two ORA* keys below are OVERWRITTEN at assembly
+         time by Scripts/bundle.sh from git (commit count, short hash + dirty flag, UTC timestamp);
+         the values here are only what an unstamped hand-assembled bundle would show.
+         CFBundleShortVersionString above is the opposite: hand-edited here, never stamped. -->
     <key>CFBundleVersion</key>
     <string>1</string>
+    <key>ORAGitRevision</key>
+    <string>unknown</string>
+    <key>ORABuildDate</key>
+    <string>unknown</string>
     <key>LSMinimumSystemVersion</key>
     <string>26.0</string>
     <key>LSApplicationCategoryType</key>

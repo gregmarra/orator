@@ -21,6 +21,20 @@ rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN_DIR/Orator" "$APP_DIR/Contents/MacOS/Orator"
 cp Resources/Info.plist "$APP_DIR/Contents/Info.plist"
+
+# Stamp the build fingerprint into the copied plist (the template in Resources/ stays clean, so a
+# build never dirties the tree it is fingerprinting). Read back at runtime by `AppVersion` and shown
+# at the bottom of the settings pane. Must run BEFORE codesign below — the plist is sealed into the
+# signature. Outside a git checkout every value falls back and the footer just shows less.
+GIT_REV="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+[ -n "$(git status --porcelain 2>/dev/null)" ] && GIT_REV="$GIT_REV-dirty"
+# Commit count as CFBundleVersion: monotonic, which is what macOS and any updater require of it.
+BUILD_NUM="$(git rev-list --count HEAD 2>/dev/null || echo 0)"
+BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+plutil -replace CFBundleVersion -string "$BUILD_NUM"  "$APP_DIR/Contents/Info.plist"
+plutil -replace ORAGitRevision  -string "$GIT_REV"    "$APP_DIR/Contents/Info.plist"
+plutil -replace ORABuildDate    -string "$BUILD_DATE" "$APP_DIR/Contents/Info.plist"
+echo "Version stamp: $(plutil -extract CFBundleShortVersionString raw "$APP_DIR/Contents/Info.plist") ($BUILD_NUM) $GIT_REV"
 # App icon. Ship the prebuilt layered Liquid Glass asset (Assets.car, referenced by
 # CFBundleIconName) + a fallback AppIcon.icns. Both are compiled from Resources/AppIcon.icon via
 # `Scripts/build-icon.sh` (actool). We copy the prebuilt outputs rather than run actool here because

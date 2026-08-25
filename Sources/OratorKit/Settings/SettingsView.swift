@@ -62,6 +62,8 @@ public struct SettingsView: View {
                 // this "Reset Setup and Permissions…" in red promised an irreversible revoke it never
                 // performed, and simultaneously hid setup behind a button nobody wanting setup would press.
                 Button("Open Setup…") { onReset?() }
+            } footer: {
+                versionFooter
             }
         }
         .formStyle(.grouped)
@@ -77,6 +79,18 @@ public struct SettingsView: View {
         // own job (ORA-CAP-026) — the `controlActiveState` gate that used to live here was a second,
         // weaker copy of the monitor's app-active handling, and it was the copy that had no answer for
         // a display going to sleep.
+    }
+
+    /// Build fingerprint, stamped into `Info.plist` from git by `Scripts/bundle.sh`. Selectable
+    /// because its whole job is to be pasted into a bug report; the tooltip carries the build date,
+    /// which is the only thing that tells two `-dirty` builds of one commit apart.
+    @ViewBuilder private var versionFooter: some View {
+        Text(AppVersion.displayString)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .help(AppVersion.buildDate.map { "Built \($0)" } ?? AppVersion.displayString)
     }
 
     /// Microphone picker: "Automatic" (follow the system default) or a pinned "Built-in" — those two
