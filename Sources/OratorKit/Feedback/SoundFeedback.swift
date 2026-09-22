@@ -5,7 +5,7 @@ import AVFoundation
 /// Audio ducking (ORA-FBK-002) intentionally not in v1: off-by-default, intrusive, adds surface for
 /// no required benefit.
 ///
-/// The three dictation cues are ONE sound at three pitches — the system "Tink", played as-is to start,
+/// The three dictation cues are ONE sound at three pitches (ORA-FBK-001) — the system "Tink", played as-is to start,
 /// slightly lower to confirm an insert, and a full octave down when nothing was heard. Relatedness is
 /// the point: they read as one family, and pitch alone says which outcome it was, so no cue has to be
 /// loud or alarming to be distinguishable. Failures still get the system error sound, which should

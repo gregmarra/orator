@@ -22,7 +22,7 @@ mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN_DIR/Orator" "$APP_DIR/Contents/MacOS/Orator"
 cp Resources/Info.plist "$APP_DIR/Contents/Info.plist"
 
-# Stamp the build fingerprint into the copied plist (the template in Resources/ stays clean, so a
+# Stamp the build fingerprint into the copied plist (ORA-BLD-005; the template in Resources/ stays clean, so a
 # build never dirties the tree it is fingerprinting). Read back at runtime by `AppVersion` and shown
 # at the bottom of the settings pane. Must run BEFORE codesign below — the plist is sealed into the
 # signature. Outside a git checkout every value falls back and the footer just shows less.

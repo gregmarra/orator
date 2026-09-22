@@ -16,7 +16,7 @@ enum SentenceContext {
     /// find the punctuation that actually decides the case.
     private static let closers: Set<Character> = ["\"", "'", ")", "]", "}", "”", "’"]
 
-    /// Should the inserted text begin a new sentence (i.e. get a capital first letter)?
+    /// Should the inserted text begin a new sentence (i.e. get a capital first letter)? (ORA-INS-009)
     ///
     /// True at the start of an empty field and after a sentence terminator or a line break; false
     /// mid-sentence — after a word, a comma, or any other clause punctuation. When the preceding text

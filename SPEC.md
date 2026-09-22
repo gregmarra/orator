@@ -412,8 +412,10 @@ Invariants (all MUST):
 - ORA-ASR-007 (SHOULD): Native punctuation from the recognizer SHOULD be preserved as-is; Orator SHOULD NOT
   apply a spoken-punctuation substitution layer in v1. As the one sanctioned default edit (a narrow exception
   to ORA-ACC-002), Orator MAY trim a run of stray leading sentence-delimiter punctuation at the very start of a
-  finalized utterance (the recognizer renders an opening pause/breath as "..", ",…", "…") and capitalize the
-  first word; internal punctuation and casing are left untouched.
+  finalized utterance (the recognizer renders an opening pause/breath as "..", ",…", "…"). The case of the
+  first word is NOT decided here: the recognizer capitalizes the first word of every utterance, and whether
+  that is right depends on what already precedes the caret, which only the insertion step knows
+  (ORA-INS-009). Internal punctuation and casing are left untouched.
 - ORA-ASR-008 (MUST): The active locale is a setting. The Language picker is populated **dynamically** from
   `SpeechTranscriber.supportedLocales` (every locale the on-device transcriber supports — not a hard-coded
   list). Selecting a locale whose model isn't installed triggers the OS model install
@@ -487,8 +489,22 @@ Invariants (all MUST):
   best-effort in that case, with the residual risk recorded as R13.
 - ORA-INS-008 (SHOULD): When the caret sits immediately after a non-whitespace character, Orator SHOULD prepend
   a single separating space to the inserted text so back-to-back dictations into the same field do not run
-  together. This is best-effort: it reads the field value and caret offset via Accessibility and does nothing
-  when either is unavailable.
+  together. This is best-effort: it reads a short window of text before the caret via Accessibility as a
+  **ranged** read first (many text areas, WhatsApp among them, refuse to hand over their whole value while
+  still reporting the caret, and a whole-value read there came back nil); it falls back to slicing the whole
+  value for fields that answer that instead, to the end of the whole value when no caret offset is reported,
+  and does nothing when nothing is readable.
+- ORA-INS-009 (SHOULD): The case of the inserted text's first word MUST be decided from the same caret context,
+  at insertion, not upstream. The recognizer capitalizes the first word of **every** utterance, since each
+  dictation looks like a fresh sentence to it. Orator SHOULD keep that capital where the context says a
+  sentence starts (an empty field, a line break, a sentence terminator, or interface chrome such as a shell
+  prompt) and SHOULD undo it where the sentence carries on (after a word, a comma, or other clause
+  punctuation). Undoing is conservative by grammatical class: only a word the platform's tagger classes as a
+  verb, adverb, conjunction, determiner, preposition, interjection, pronoun, or particle is lower-cased, so
+  anything that might be a name keeps its capital, and the pronoun "I" is always kept. Unreadable context
+  means a sentence start, which matches standalone text bound for the recovery menu. *Rationale: capitalizing
+  unconditionally made every continuation after "hello," come back as "Hello"; a stray capital is a far
+  smaller error than a mangled name, so the fix errs toward leaving text alone (ORA-ACC-002).*
 
 ### 8.7 Recovery Buffer
 
@@ -557,13 +573,20 @@ Invariants (all MUST):
 
 ### 8.9 Audio Feedback
 
-- ORA-FBK-001 (SHOULD): Orator SHOULD play a subtle **start** cue and **stop** cue. The start cue plays
-  concurrently with capture start rather than gating it: meeting the start-latency budget (M1, a MUST) takes
-  precedence over keeping the cue out of the audio, and a brief overlap of a subtle cue is acceptable.
+- ORA-FBK-001 (SHOULD): Orator SHOULD play subtle cues for the outcomes of a dictation, as **one sound at
+  three pitches** so they read as a family and pitch alone says which outcome it was: the **start** cue as-is,
+  the **inserted** cue slightly lower, and a **nothing-heard** cue a full octave down for a dictation that
+  produced no text. The inserted cue means the text landed in the target and nothing else; a result that went
+  to the recovery buffer, a capture that died, and a hotkey press that could not start all get the system
+  **error** sound, which should sound like an intrusion because it is one. Hearing nothing is benign and
+  MUST NOT use the error sound. The start cue plays concurrently with capture start rather than gating it:
+  meeting the start-latency budget (M1, a MUST) takes precedence over keeping the cue out of the audio, and
+  a brief overlap of a subtle cue is acceptable.
 - ORA-FBK-002 (MAY): Orator MAY duck other system audio while recording to reduce speaker bleed into the mic.
   This MUST be off by default (it is intrusive) and MUST be a setting if offered.
-- ORA-FBK-003 (SHOULD): Cues SHOULD respect the system output device and a user volume setting, and SHOULD be
-  suppressible.
+- ORA-FBK-003 (SHOULD): Cues SHOULD play on the system output device at the system volume, and MUST be
+  suppressible by the single sound on/off setting (ORA-CFG-001). There is no separate volume control: the
+  cues are system sounds, and the system's own output volume is where that choice already lives.
 
 ### 8.10 Settings
 
@@ -605,8 +628,8 @@ Invariants (all MUST):
 - ORA-ACC-001 (MUST): Prefer input-quality measures that raise accuracy (a good input device, the most
   accurate recognizer module — ORA-VOC-002) over cosmetic post-processing that risks it.
 - ORA-ACC-002 (MUST): Any transformation of recognizer output MUST be conservative and reversible in intent —
-  no default lossy edits, except the single narrow leading-artifact trim sanctioned in ORA-ASR-007
-  (ORA-VOC-004, ORA-ASR-007).
+  no default lossy edits, except the two narrow, sanctioned ones: the leading-artifact trim (ORA-ASR-007)
+  and the first-word case fix from caret context (ORA-INS-009). (ORA-VOC-004, ORA-ASR-007, ORA-INS-009)
 
 ### 9.3 Privacy
 
@@ -841,6 +864,12 @@ where a seam allows).
   distribution is a notarized zip. No auto-update framework.
 - ORA-BLD-004 (SHOULD): A headless (non-shipped) test harness MAY exercise the audio→analyzer→insertion path
   without a microphone or user.
+- ORA-BLD-005 (SHOULD): Every bundle SHOULD carry a **build fingerprint**: the commit count as
+  `CFBundleVersion` (monotonic, as macOS requires), the short git revision with a `-dirty` suffix when the
+  tree had uncommitted changes, and the build date, stamped into the bundled `Info.plist` at assembly (never
+  into the template in the source tree) and shown at the foot of the settings pane. *Rationale: dev builds
+  change under a friend's Mac several times a week, and "which build are you on?" has to be answerable from
+  the app itself.*
 
 ---
 
