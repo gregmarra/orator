@@ -80,7 +80,7 @@ that trade against them.
 | **M4. Text-loss incidents** — dictated speech irrecoverable after a failed insertion | 0 |
 | **M5. Product surface** — user-facing settings controls | ≤ 8 |
 | **M6. Runtime dependencies** — third-party libraries linked | 0 |
-| **M7. Accuracy** — subjective: no worse than the platform’s built-in dictation on the user’s daily vocabulary, and better on their custom terms | — |
+| **M7. Accuracy** — subjective: no worse than the platform’s built-in dictation on the user’s daily vocabulary | — |
 
 ---
 
@@ -423,21 +423,25 @@ Invariants (all MUST):
 
 ### 8.5 Vocabulary & Correction
 
-- ORA-VOC-001 (MUST): Orator MUST let the user maintain a **custom vocabulary** (names, jargon, product
-  terms) that biases recognition toward those terms.
-- ORA-VOC-002 (MUST): The vocabulary MUST be supplied to the recognizer through the Speech framework’s
-  contextual mechanism — per-request contextual biasing via `AnalysisContext.contextualStrings[.general]`,
-  applied to the analyzer's context at session start. **Only `DictationTranscriber` honours contextual
-  strings**; `SpeechTranscriber` accepts the context without error and ignores it, so a session with a
-  non-empty vocabulary MUST run on `DictationTranscriber` (sessions with no vocabulary keep the default
-  `SpeechTranscriber`). Contextual strings are capped at 100 terms — an oversized array can drop the whole
-  set rather than the excess. Custom *pronunciations* via `SFCustomLanguageModelData` are deferred (§17) and
-  not needed for term biasing.
+- ORA-VOC-001 (MUST NOT): Orator MUST NOT offer a **custom vocabulary**. There is no term list in
+  Settings and no vocabulary key in `UserDefaults`. *Rationale: the only recognizer-side use for such a
+  list is contextual biasing, which ORA-VOC-002 rules out; a list that changes nothing is a knob for its
+  own sake (principle 1). Retired 2026-07-29; the ID is kept so it is never reused for something else.*
+- ORA-VOC-002 (MUST NOT): Orator MUST NOT bias recognition through `AnalysisContext.contextualStrings`,
+  and MUST run every session on `SpeechTranscriber`. **Only `DictationTranscriber` honours contextual
+  strings**; `SpeechTranscriber` accepts them without error and ignores them, so biasing can be had only
+  by running the older module. Measured on our own corpus (2026-07-30) rather than taken on faith:
+  `DictationTranscriber` costs ~8% relative WER (0.192 → 0.207) and, with biasing, recovers one extra
+  custom term in five; the same strings passed to `SpeechTranscriber` change nothing at all. The better
+  model, always, is the product. *Reopen only if a platform release makes `SpeechTranscriber` honour
+  contextual strings — re-run the harness first (§14.1).*
 - ORA-VOC-003 (SHOULD, deferred): A conservative post-recognition correction pass MAY repair systematic
-  mis-splits of known custom terms (e.g. a multi-token rendering collapsing into a single vocabulary term).
-  If built, it **MUST** operate only against the user’s explicit vocabulary, use a precision-first threshold,
-  preserve original casing and punctuation, and **never** alter text that does not closely match a known term.
-  *Deferred: a correction pass that fires too eagerly harms accuracy, which is priority #1.*
+  mis-splits of known terms (e.g. a multi-token rendering collapsing into a single term). If built, it
+  **MUST** operate only against a term list the user maintains explicitly for this purpose — the sole form a
+  vocabulary can take now, downstream of the recognizer and never inside it (ORA-VOC-002) — use a
+  precision-first threshold, preserve original casing and punctuation, and **never** alter text that does
+  not closely match a known term. *Deferred: a correction pass that fires too eagerly harms accuracy, which
+  is priority #1; build it only against real misrecognition data (§17).*
 - ORA-VOC-004 (MUST NOT): Orator MUST NOT strip disfluencies/filler words by default. Verbatim output is the
   accurate output; removing words risks removing intended ones.
 
@@ -564,8 +568,8 @@ Invariants (all MUST):
 ### 8.10 Settings
 
 - ORA-CFG-001 (MUST): Settings MUST be a single small pane exposing at most: hotkey, language/locale,
-  microphone choice (follow-default vs. built-in only), custom vocabulary list, launch-at-login, and sound
-  on/off. (≤ 8 controls, M5.)
+  microphone choice (follow-default vs. built-in only), launch-at-login, and sound on/off. (≤ 8 controls,
+  M5.) No vocabulary list (ORA-VOC-001).
 - ORA-CFG-002 (MUST): Settings MUST persist via `UserDefaults`, each key with an explicit default read
   lazily at the call site (a fresh install and a missing key are indistinguishable and both yield the
   default). No schema-version stamp or migration scaffold is carried until a key's meaning actually
@@ -598,8 +602,8 @@ Invariants (all MUST):
 
 ### 9.2 Accuracy
 
-- ORA-ACC-001 (MUST): Prefer input-quality and biasing measures that raise accuracy (a good input device,
-  custom vocabulary) over cosmetic post-processing that risks it.
+- ORA-ACC-001 (MUST): Prefer input-quality measures that raise accuracy (a good input device, the most
+  accurate recognizer module — ORA-VOC-002) over cosmetic post-processing that risks it.
 - ORA-ACC-002 (MUST): Any transformation of recognizer output MUST be conservative and reversible in intent —
   no default lossy edits, except the single narrow leading-artifact trim sanctioned in ORA-ASR-007
   (ORA-VOC-004, ORA-ASR-007).
@@ -846,8 +850,9 @@ where a seam allows).
   results and a managed model-asset inventory on macOS 26 (Apple Silicon).
 - A2. The platform exposes focused-element access and programmatic text insertion via the Accessibility API,
   and global hotkey registration via the OS.
-- A3. Custom-vocabulary biasing is available per-request via `AnalysisContext.contextualStrings` — but only
-  on `DictationTranscriber` (see ORA-VOC-002).
+- A3. `SpeechTranscriber` is the more accurate module and ignores `AnalysisContext.contextualStrings`;
+  only `DictationTranscriber` honours them (measured 2026-07-30, ORA-VOC-002). Orator runs
+  `SpeechTranscriber` unconditionally and offers no vocabulary.
 - A4. The primary user’s Mac and friends’ Macs meet the platform floor (macOS 26, Apple Silicon).
 - A5. Notch geometry is queryable via the documented `NSScreen` APIs.
 
