@@ -76,12 +76,27 @@ public final class TextInserter {
         //    dictation starts a sentence. Both come from one read of the caret context — capitalizing
         //    unconditionally upstream is what made a continuation after "hello," come back as "Hello".
         let delay = target.bundleID.flatMap { Self.settleDelays[$0] }
-        let preceding = precedingText(element)
+        let (preceding, contextSource) = precedingText(element)
         let startsSentence = SentenceContext.startsSentence(after: preceding)
         var toInsert = startsSentence ? TranscriptCleaner.capitalized(text)
                                       : TranscriptCleaner.continuing(text)
-        if SentenceContext.needsLeadingSpace(after: preceding) { toInsert = " " + toInsert }
-        return await paste(toInsert, settle: delay, element: element)
+        let leadingSpace = SentenceContext.needsLeadingSpace(after: preceding)
+        if leadingSpace { toInsert = " " + toInsert }
+        var shape = InsertShape(build: AppVersion.logStamp, app: target.bundleID, windowTitleTail: windowTitleTail(element, pid: target.pid),
+                                role: copyString(element, kAXRoleAttribute),
+                                subrole: copyString(element, kAXSubroleAttribute),
+                                domID: copyString(element, "AXDOMIdentifier"),
+                                contextSource: contextSource, contextLength: preceding?.utf16.count,
+                                lastCharacter: preceding?.last,
+                                leadingSpace: leadingSpace, startsSentence: startsSentence)
+        let outcome = await paste(toInsert, settle: delay, element: element, shape: &shape)
+        // One shape-only line per insertion, always on: no dictated text and at most ONE character
+        // of the host field, so it is safe to keep in the persistent log and read back weeks later
+        // (`.notice` is the lowest level the unified log keeps on disk). This is how a host that
+        // fakes its focused field — Google Docs hands Chrome a hidden proxy whose value is stale —
+        // gets caught: the line shows which element the decisions in step 3 were made from.
+        Log.insert.notice("Insert shape: \(shape.description, privacy: .public)")
+        return outcome
     }
 
     /// How much text before the caret we ask for. We only need the last non-whitespace character, but
@@ -98,16 +113,39 @@ public final class TextInserter {
     /// and every dictation there got capitalized as a new sentence. Falls back to the full value for
     /// fields that answer that instead, and nil for a nil element (E16) — which callers already treat as
     /// standalone text.
-    private func precedingText(_ element: AXUIElement?) -> String? {
-        guard let caret = caretLocation(element) else { return copyString(element, kAXValueAttribute) }
-        guard caret > 0 else { return "" }                    // caret at the very start ⇒ empty context
+    ///
+    /// Also reports WHICH read answered, for the insertion shape log — the same context can come from
+    /// three different attributes, and a host that fakes one of them is only identifiable by that.
+    private func precedingText(_ element: AXUIElement?) -> (text: String?, source: InsertShape.ContextSource) {
+        guard let caret = caretLocation(element) else {
+            let value = copyString(element, kAXValueAttribute)
+            return (value, value == nil ? .none : .wholeValue)
+        }
+        guard caret > 0 else { return ("", .caretAtStart) }   // caret at the very start ⇒ empty context
         let start = max(0, caret - Self.contextWindow)
-        if let window = stringForRange(element, location: start, length: caret - start) { return window }
+        if let window = stringForRange(element, location: start, length: caret - start) { return (window, .range) }
         // Parameterized read unsupported ⇒ fall back to slicing the full value, if we can get it.
-        guard let text = copyString(element, kAXValueAttribute) else { return nil }
+        guard let text = copyString(element, kAXValueAttribute) else { return (nil, .none) }
         let units = Array(text.utf16)                          // AX offsets are UTF-16
         let end = min(caret, units.count)                      // clamp: a stale caret can outrun the value
-        return String(decoding: units[0..<end], as: UTF16.self)
+        return (String(decoding: units[0..<end], as: UTF16.self), .valueSlice)
+    }
+
+    /// The tail of the focused window's title — the part after the last " - ", which is where web
+    /// apps put their product name ("… - Google Docs"). Only the tail is kept so a document name
+    /// never reaches the log. Falls back to the app's focused window when there is no element.
+    private func windowTitleTail(_ element: AXUIElement?, pid: pid_t) -> String? {
+        var windowRef: CFTypeRef?
+        if let element {
+            _ = AXUIElementCopyAttributeValue(element, kAXWindowAttribute as CFString, &windowRef)
+        }
+        if windowRef == nil {
+            let app = AXUIElementCreateApplication(pid)
+            _ = AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &windowRef)
+        }
+        guard let windowRef, CFGetTypeID(windowRef) == AXUIElementGetTypeID(),
+              let title = copyString((windowRef as! AXUIElement), kAXTitleAttribute) else { return nil }
+        return InsertShape.titleTail(of: title)
     }
 
     /// Caret offset (UTF-16) within the focused element, if it reports one.
@@ -171,8 +209,10 @@ public final class TextInserter {
 
     // MARK: Paste
 
-    private func paste(_ text: String, settle: Duration?, element: AXUIElement?) async -> InsertionOutcome {
+    private func paste(_ text: String, settle: Duration?, element: AXUIElement?,
+                       shape: inout InsertShape) async -> InsertionOutcome {
         let preValue = copyString(element, kAXValueAttribute)   // for best-effort verification
+        shape.valueLengthBefore = preValue?.utf16.count
         let snapshot = Pasteboard.snapshot()
         let ourChangeCount = Pasteboard.writeConcealed(text)
 
@@ -184,6 +224,7 @@ public final class TextInserter {
         // ⌘V, a modal that stole the keystroke) still reported `.inserted`: success cue, "Inserted" in
         // the menu, and the 5-minute TTL then deleted the only copy (E15 / SPEC §694).
         let landed = await awaitPasteConsumed(preValue: preValue, element: element)
+        shape.verification = preValue == nil ? .unverifiable : (landed ? .landed : .rejected)
 
         // Restore on its own task so it never delays the caller's completion cue (ORA-INS-005), after
         // a conservative safety delay when the paste couldn't be confirmed — always guarded by
