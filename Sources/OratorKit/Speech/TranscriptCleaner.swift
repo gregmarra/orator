@@ -41,7 +41,8 @@ enum TranscriptCleaner {
         .verb, .adverb, .conjunction, .determiner, .preposition, .interjection, .pronoun, .particle,
     ]
 
-    /// Undo the recognizer's utterance-start capital when this text continues an existing sentence.
+    /// Undo the recognizer's utterance-start capital when this text continues an existing sentence
+    /// (ORA-INS-009).
     ///
     /// The recognizer capitalizes the first word of EVERY utterance — each dictation looks like a
     /// fresh sentence to it — so continuing after a comma yields "Let's" where "let's" is wanted.
