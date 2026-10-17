@@ -9,7 +9,6 @@ Orator.app/
 # Local scratch (not committed)
 todo.md
 
-# Rendered media: only the README hero GIF is tracked; PNG stills + mp4 are
-# regenerable via OratorReel.
+# Rendered media: only the README hero GIF is tracked.
 assets/*
 !assets/reel.gif
