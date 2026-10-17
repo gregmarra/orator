@@ -297,8 +297,8 @@ public final class SessionCoordinator: SpeechResultSink {
                 Log.session.notice("Hotkey ignored: not ready (\(String(describing: self.readiness)))")
                 return
             }
-            starting = true                    // synchronous guard before the async start
-            Task { await startRecording() }
+            starting = true                    // held until the async session attach finishes
+            startRecording()
         case .recording:
             Task { await finish() }
         case .finalizing, .inserting:
@@ -352,15 +352,20 @@ public final class SessionCoordinator: SpeechResultSink {
         feedback.playError()
     }
 
-    private func startRecording() async {
+    /// Synchronous up to capture start, so a hotkey press reaches the microphone with no main-actor
+    /// hop in between (M1, ORA-PERF-004). The engine session attaches afterwards, in `attachSession`.
+    /// Every path out clears `starting`, directly or once its async tail is done.
+    private func startRecording() {
         let began = ContinuousClock.now
-        defer { starting = false }
-        guard state == .idle else { return }
+        guard state == .idle else { starting = false; return }
         guard engine.isWarm, let format = engine.inputFormat else {
             Log.session.error("Cannot start: engine not warm")
-            // A model problem renames itself via readiness; anything else is a transient engine fault.
-            if await downgradeReadinessIfModelUnavailable() { failStart(readiness.shortReason) }
-            else { failStart("Speech engine isn’t ready — try again") }
+            Task {
+                defer { starting = false }
+                // A model problem renames itself via readiness; anything else is a transient engine fault.
+                if await downgradeReadinessIfModelUnavailable() { failStart(readiness.shortReason) }
+                else { failStart("Speech engine isn’t ready — try again") }
+            }
             return
         }
         // TCC mic access can be revoked after launch; capturing without it doesn't throw — it just
@@ -370,6 +375,7 @@ public final class SessionCoordinator: SpeechResultSink {
             Log.session.error("Cannot start: microphone permission not granted")
             readiness = .needsPermission(permissions.missing())
             failStart("Mic access is off — see System Settings")
+            starting = false
             return
         }
 
@@ -393,6 +399,7 @@ public final class SessionCoordinator: SpeechResultSink {
             // Capture failed to start ⇒ stay idle, legible reason on every channel (ORA-SM-004 / E5).
             Log.session.error("Audio start failed: \(error.localizedDescription)")
             failStart("Couldn’t start the microphone.")
+            starting = false
             return
         }
 
@@ -403,6 +410,12 @@ public final class SessionCoordinator: SpeechResultSink {
         DebugLog.stage("start→capturing", ms: (ContinuousClock.now - began).milliseconds)   // M1 (ORA-PERF-004)
         feedback.playStart()                                      // non-blocking cue (overlapped)
 
+        Task { await attachSession(stream) }
+    }
+
+    /// The async half of a start: attach a transcription session to the capture already running.
+    private func attachSession(_ stream: AsyncStream<AnalyzerInput>) async {
+        defer { starting = false }
         let token = await engine.beginSession()
 
         // `beginSession` is a suspension point: a second hotkey press during it runs finish() →

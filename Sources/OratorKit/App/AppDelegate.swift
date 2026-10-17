@@ -20,8 +20,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     private lazy var statusItem = StatusItemController(coordinator: coordinator)
     private let indicator = IndicatorController()
+    // Carbon delivers hot-key events on the main thread, so toggle runs right here rather than after
+    // a Task hop that could queue the press behind other main-actor work (M1, ORA-PERF-004).
     private lazy var hotkey = HotkeyManager(onFire: { [weak self] in
-        Task { @MainActor in self?.coordinator.toggle() }
+        MainActor.assumeIsolated { self?.coordinator.toggle() }
     })
 
     /// False when the saved chord couldn't be registered at launch, so Settings can say why the
