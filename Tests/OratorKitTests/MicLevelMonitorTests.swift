@@ -216,16 +216,11 @@ final class MicLevelMonitorTests: XCTestCase {
     }
 
     /// Settings closed while the screens were asleep, the screens woke while it was closed, then it
-    /// reopened. The user is plainly in front of the machine, so the meter should run.
-    ///
-    /// It doesn't: `stop()` removes the lifecycle observers, so the wake is never heard, and `start()`
-    /// re-reads `appActive` but not `screensAwake` — the stale `false` keeps the meter dead until the
-    /// next sleep/wake cycle. This fails safe (the mic is released, not held), so it is not the
-    /// orange-indicator bug, but it is a real ordering defect in the same rule.
+    /// reopened. The user is plainly in front of the machine, so the meter should run — even though
+    /// `stop()` removed the lifecycle observers and the wake itself went unheard.
     func testReopeningAfterAWakeMissedWhileClosedMetersAgain() async throws {
         let rig = Rig()
         try await run([.start, .sleep, .stop, .wake, .start], on: rig)
-        XCTExpectFailure("start() does not re-read screensAwake, and the wake arrived while observers were removed")
         XCTAssertTrue(rig.capture.isOpen)
         rig.monitor.stop()
     }

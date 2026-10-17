@@ -108,6 +108,9 @@ public final class MicLevelMonitor {
     public func start() {
         settingsOpen = true
         appActive = isAppActive()
+        // Opening Settings takes a user at an awake screen. A wake that arrived while Settings was
+        // closed went unheard (the observers were removed), so don't trust the stale sleep flag.
+        screensAwake = true
         observeLifecycle()
         sync()
     }
