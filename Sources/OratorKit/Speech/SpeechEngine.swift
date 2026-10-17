@@ -56,7 +56,7 @@ private final class FinalizeRace: @unchecked Sendable {
 /// trivial synchronous work, so it never blocks main. The single results task (ORA-CC-003) then
 /// forwards to the coordinator with zero actor hops (both are on the main actor).
 @MainActor
-public final class SpeechEngine {
+public final class SpeechEngine: SpeechTranscribing {
     public enum EngineError: Error, Sendable {
         case modelUnavailable(ModelStatus)
     }
@@ -66,6 +66,9 @@ public final class SpeechEngine {
     /// cancel can't bleed the previous dictation's trailing audio into the next transcript.
     public struct SessionToken: Sendable, Equatable {
         fileprivate let id: UInt64
+        /// Internal, not fileprivate, only so a test double of `SpeechTranscribing` can mint tokens;
+        /// production tokens come solely from `beginSession`.
+        init(id: UInt64) { self.id = id }
     }
 
     private var locale: Locale
