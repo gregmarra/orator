@@ -24,6 +24,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         Task { @MainActor in self?.coordinator.toggle() }
     })
 
+    /// False when the saved chord couldn't be registered at launch, so Settings can say why the
+    /// hotkey does nothing instead of the failure living only in the log.
+    private var hotkeyRegistered = true
     private var settingsWindow: NSWindow?
     private var onboardingWindow: NSWindow?
     /// The Settings level meter. Owned HERE rather than by the SwiftUI view so that closing the
@@ -53,7 +56,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in Task { @MainActor in await self?.refreshAndWarm() } }
 
-        hotkey.register(Settings.shared.hotkey)
+        hotkeyRegistered = hotkey.register(Settings.shared.hotkey)
         // Full bring-up: readiness → onboarding sync → warm engine. Setup is guided through the
         // crash-free menu-bar menu, not an auto-shown SwiftUI window; the icon reflects not-ready.
         Task { await refreshAndWarm() }
@@ -302,7 +305,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         let view = SettingsView(
             language: language,
             meter: meter,
-            onHotkeyChange: { [weak self] chord in self?.hotkey.register(chord) },
+            hotkeyError: hotkeyRegistered ? nil : SettingsView.hotkeyTakenMessage,
+            onHotkeyChange: { [weak self] chord in
+                let ok = self?.hotkey.register(chord) ?? false
+                if ok { self?.hotkeyRegistered = true }
+                return ok
+            },
             onHotkeyRecording: { [weak self] active in
                 // Suspend the global hotkey while recording so pressing the current combo reaches the
                 // recorder instead of firing Orator; restore it (with whatever chord is now set) after.

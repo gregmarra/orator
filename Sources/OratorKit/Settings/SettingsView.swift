@@ -14,12 +14,18 @@ public struct SettingsView: View {
     @State private var launchAtLogin: Bool = LaunchAtLogin.isEnabled
     @State private var soundEnabled: Bool = Settings.shared.soundEnabled
     @State private var recordingHotkey = false
+    /// Why the last chord couldn't be registered, shown under the recorder until the next try.
+    @State private var hotkeyError: String?
     @Bindable private var language: LanguageModel
     /// A not-yet-installed language the user picked, awaiting download confirmation.
     @State private var pendingInstallID: String?
 
-    /// Invoked when the hotkey chord changes so the app can re-register it.
-    public var onHotkeyChange: ((HotkeyChord) -> Void)?
+    /// Shown when the system refuses a chord, at launch or after recording one.
+    public static let hotkeyTakenMessage = "Couldn’t use this shortcut — another app may already have it."
+
+    /// Invoked when the hotkey chord changes so the app can re-register it. Returns false if the
+    /// system refused the chord; the view then keeps the previous one rather than saving a dead chord.
+    public var onHotkeyChange: ((HotkeyChord) -> Bool)?
     /// Invoked when the hotkey recorder becomes active/inactive. While active, the app MUST suspend
     /// the global hotkey so the user can press their current combo without it firing Orator.
     public var onHotkeyRecording: ((Bool) -> Void)?
@@ -28,11 +34,13 @@ public struct SettingsView: View {
 
     public init(language: LanguageModel,
                 meter: MicLevelMonitor,
-                onHotkeyChange: ((HotkeyChord) -> Void)? = nil,
+                hotkeyError: String? = nil,
+                onHotkeyChange: ((HotkeyChord) -> Bool)? = nil,
                 onHotkeyRecording: ((Bool) -> Void)? = nil,
                 onReset: (() -> Void)? = nil) {
         self._language = Bindable(language)
         self.meter = meter
+        self._hotkeyError = State(initialValue: hotkeyError)
         self.onHotkeyChange = onHotkeyChange
         self.onHotkeyRecording = onHotkeyRecording
         self.onReset = onReset
@@ -43,10 +51,22 @@ public struct SettingsView: View {
             Section {
                 LabeledContent("Hotkey") {
                     HotkeyField(chord: $hotkey, recording: $recordingHotkey) { chord in
-                        Settings.shared.hotkey = chord
-                        onHotkeyChange?(chord)
+                        // Save only a chord the system accepted. On refusal the view reverts, and the
+                        // recorder's end re-registers the still-saved previous chord.
+                        if onHotkeyChange?(chord) ?? true {
+                            Settings.shared.hotkey = chord
+                            hotkeyError = nil
+                        } else {
+                            hotkey = Settings.shared.hotkey
+                            hotkeyError = Self.hotkeyTakenMessage
+                        }
                     }
                     .onChange(of: recordingHotkey) { _, active in onHotkeyRecording?(active) }
+                }
+                if let hotkeyError {
+                    Text(hotkeyError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
                 languageRow
                 micRow
@@ -234,15 +254,23 @@ struct HotkeyField: View {
     @Binding var recording: Bool
     var onChange: (HotkeyChord) -> Void
 
+    /// Set when the last key pressed in the recorder had no ⌘, ⌥ or ⌃; recording continues.
+    @State private var needsModifier = false
+
     var body: some View {
         // Click to enter "set" mode. Capture view mounts ONLY while recording — never steals key events
         // until asked — and grabs focus synchronously on mount (no async first-responder juggling).
-        Button(recording ? "Press a key…  (Esc to cancel)" : describe(chord)) { recording = true }
+        Button(recording ? (needsModifier ? "Add ⌘, ⌥ or ⌃  (Esc to cancel)" : "Press a key…  (Esc to cancel)")
+                         : describe(chord)) { needsModifier = false; recording = true }
             .buttonStyle(.bordered)
             .overlay {
                 if recording {
                     KeyCaptureView(
-                        onCapture: { newChord in chord = newChord; recording = false; onChange(newChord) },
+                        onCapture: { newChord in
+                            // A chord that would claim a plain key everywhere is refused; keep recording.
+                            guard newChord.isUsableGlobally else { needsModifier = true; NSSound.beep(); return }
+                            chord = newChord; recording = false; onChange(newChord)
+                        },
                         onCancel: { recording = false })
                         .frame(width: 1, height: 1)
                         .allowsHitTesting(false)

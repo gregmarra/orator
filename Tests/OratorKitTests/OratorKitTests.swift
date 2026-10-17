@@ -137,6 +137,15 @@ final class OratorKitTests: XCTestCase {
         }
     }
 
+    // A chord the recorder may save: a plain or ⇧-only key would be claimed from every app.
+    func testHotkeyChordNeedsBlockingModifier() {
+        XCTAssertTrue(HotkeyChord.defaultChord.isUsableGlobally)
+        XCTAssertFalse(HotkeyChord(keyCode: UInt32(kVK_ANSI_A), modifiers: 0).isUsableGlobally)
+        XCTAssertFalse(HotkeyChord(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(shiftKey)).isUsableGlobally)
+        XCTAssertTrue(HotkeyChord(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(controlKey | shiftKey)).isUsableGlobally)
+        XCTAssertTrue(HotkeyChord(keyCode: UInt32(kVK_F13), modifiers: 0).isUsableGlobally)
+    }
+
     // ORA-CFG-002: settings defaults + round-trip via an isolated suite.
     @MainActor
     func testSettingsDefaultsAndPersistence() {

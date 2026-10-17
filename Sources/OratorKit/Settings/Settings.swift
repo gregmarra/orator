@@ -8,6 +8,19 @@ public struct HotkeyChord: Codable, Equatable, Sendable {
 
     /// ⌥Space — the default. Does NOT bind fn/Globe (ORA-ACT-005).
     public static let defaultChord = HotkeyChord(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey))
+
+    /// Whether this chord is safe to claim system-wide. A plain key — or one with only ⇧ — would be
+    /// taken from every app (a stray "a" in the recorder made "a" untypeable, across relaunches), so
+    /// it needs ⌘, ⌥ or ⌃. Function keys are the exception: nothing types them.
+    public var isUsableGlobally: Bool {
+        let blocking = UInt32(cmdKey) | UInt32(optionKey) | UInt32(controlKey)
+        return modifiers & blocking != 0 || Self.functionKeys.contains(Int(keyCode))
+    }
+
+    private static let functionKeys: Set<Int> = [
+        kVK_F1, kVK_F2, kVK_F3, kVK_F4, kVK_F5, kVK_F6, kVK_F7, kVK_F8, kVK_F9, kVK_F10,
+        kVK_F11, kVK_F12, kVK_F13, kVK_F14, kVK_F15, kVK_F16, kVK_F17, kVK_F18, kVK_F19, kVK_F20,
+    ]
 }
 
 /// How Orator chooses its capture device (ORA-CAP-002). Exactly two states, by spec — there is
