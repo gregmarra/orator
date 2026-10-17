@@ -23,7 +23,7 @@ enum SentenceContext {
     /// isn't readable the caller supplies nil and we assume a sentence start, which matches the
     /// standalone case (a fresh field, or text bound for the recovery menu).
     static func startsSentence(after preceding: String?) -> Bool {
-        guard let preceding else { return true }
+        guard let preceding = visible(preceding) else { return true }
         // A trailing newline means a new line/paragraph, which always starts a sentence. Checked
         // before trimming, since trimming would discard exactly this evidence.
         if let last = preceding.last, last.isNewline { return true }
@@ -45,7 +45,22 @@ enum SentenceContext {
     /// non-whitespace character (ORA-INS-008)? Back-to-back dictations into the same field would
     /// otherwise run together.
     static func needsLeadingSpace(after preceding: String?) -> Bool {
-        guard let preceding, let last = preceding.last else { return false }
+        guard let preceding = visible(preceding), let last = preceding.last else { return false }
         return !last.isWhitespace
+    }
+
+    /// The preceding text with its invisible format characters (Unicode general category Cf —
+    /// U+200B ZERO WIDTH SPACE, U+FEFF BOM, U+2060 WORD JOINER, …) removed, so both decisions see
+    /// only what the user sees. `Character.isWhitespace` is false for these, so without this they
+    /// read as visible text: Google Docs reports a lone U+200B before the caret in an empty
+    /// paragraph, which earned dictation there a spurious leading space, and "word\u{200B}" was
+    /// taken as a sentence start. Removed throughout the (small) context window rather than only at
+    /// the end, so "word\u{200B} " still reads as a word followed by a space. A string of nothing
+    /// but format characters becomes "", i.e. an empty field.
+    static func visible(_ preceding: String?) -> String? {
+        guard let preceding else { return nil }
+        var scalars = String.UnicodeScalarView()
+        scalars.append(contentsOf: preceding.unicodeScalars.filter { $0.properties.generalCategory != .format })
+        return String(scalars)
     }
 }
