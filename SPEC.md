@@ -473,10 +473,13 @@ Invariants (all MUST):
   - Save the **entire** existing pasteboard contents (all representations, not just plain string) and record
     the pasteboard `changeCount`.
   - Mark its own pasteboard write as **transient/concealed** (using the concealed-content pasteboard type) so
-    clipboard-manager utilities do not persist the dictated text to disk.
+    clipboard-manager utilities do not persist the dictated text to disk, and scope it to the **current host**
+    so it never reaches the user's other devices via Universal Clipboard.
   - Restore the original contents on a background task **after** the paste is verified, *unless* the
     `changeCount` has advanced (the user copied something meanwhile), in which case it MUST NOT clobber the
-    newer clipboard.
+    newer clipboard. If the original contents were themselves marked concealed, transient or auto-generated
+    (e.g. a password manager's copied secret), Orator MUST NOT restore them, and leaves the pasteboard empty:
+    a restore would defeat the other app's own timed clear.
   - Fire the completion cue immediately after the paste verifies; clipboard restore MUST NOT block it.
 - ORA-INS-006 (SHOULD): For host applications known to require synthetic paste and/or a longer settle delay
   (e.g. certain terminal emulators), Orator SHOULD apply the necessary per-application adjustment. This is a

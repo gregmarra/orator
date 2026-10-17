@@ -121,6 +121,22 @@ final class OratorKitTests: XCTestCase {
         }
     }
 
+    // ORA-INS-005: a password manager's concealed copy is never written back — restoring it would
+    // defeat the manager's timed clear — and the dictated text doesn't linger in its place.
+    @MainActor
+    func testPasteboardDoesNotRestoreSensitiveSnapshot() {
+        withPrivatePasteboard { pb in
+        let secret = NSPasteboardItem()
+        secret.setString("hunter2", forType: .string)
+        secret.setData(Data(), forType: Pasteboard.concealedType)
+        pb.clearContents(); pb.writeObjects([secret])
+        let snapshot = Pasteboard.snapshot()
+        let ourCount = Pasteboard.writeConcealed("dictated")
+        XCTAssertTrue(Pasteboard.restore(snapshot, ifUnchangedFrom: ourCount))
+        XCTAssertNil(pb.string(forType: .string))
+        }
+    }
+
     // ORA-CFG-002: settings defaults + round-trip via an isolated suite.
     @MainActor
     func testSettingsDefaultsAndPersistence() {
