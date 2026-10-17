@@ -39,6 +39,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
     public func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)   // LSUIElement / no Dock icon (ORA-PLAT-004)
 
+        // Bound every Accessibility call process-wide. An insert makes several synchronous AX calls
+        // on the main actor, and the default timeout is ~6 s each, so one hung host app could freeze
+        // the indicator and the hotkey for most of a minute. A timeout reads as "no answer", which the
+        // insert path already handles (blind paste / unverifiable). 1 s leaves slow-but-alive hosts
+        // like Chrome room to answer.
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 1.0)
+
         // A programmatic main menu (HIG SET-1): without one, standard key equivalents (⌘C/V/X/A,
         // ⌘W…) are dead in the Settings/Onboarding windows. Built with plain NSMenu — the SwiftUI
         // `Settings`/`MenuBarExtra` scenes hit a fatal executor crash on this toolchain (§11.1).
