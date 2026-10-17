@@ -360,7 +360,7 @@ public final class SessionCoordinator: SpeechResultSink {
             Log.session.error("Cannot start: engine not warm")
             // A model problem renames itself via readiness; anything else is a transient engine fault.
             if await downgradeReadinessIfModelUnavailable() { failStart(readiness.shortReason) }
-            else { failStart("Speech engine isn’t ready yet — try again.") }
+            else { failStart("Speech engine isn’t ready — try again") }
             return
         }
         // TCC mic access can be revoked after launch; capturing without it doesn't throw — it just
@@ -369,7 +369,7 @@ public final class SessionCoordinator: SpeechResultSink {
         guard permissions.microphoneGranted else {
             Log.session.error("Cannot start: microphone permission not granted")
             readiness = .needsPermission(permissions.missing())
-            failStart("Microphone access is off. Enable it in System Settings.")
+            failStart("Mic access is off — see System Settings")
             return
         }
 
@@ -561,10 +561,11 @@ public final class SessionCoordinator: SpeechResultSink {
         return head + tail
     }
 
-    /// Text was saved but not inserted: name the reason on-screen and point at where it went.
+    /// Text was saved but not inserted: name the reason on-screen and point at where it went. Held
+    /// longer than other notices — it is the only sign the text is in the menu, and that expires.
     private func deferredFeedback(_ reason: RecoveryReason) {
         feedback.playError()
-        showNotice("\(reason.label) — saved to the menu")
+        showNotice(reason.notice, for: .seconds(4))
     }
 
     /// A completed dictation that produced no text at all. Silence here reads as a broken app. When

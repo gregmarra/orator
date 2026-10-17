@@ -22,6 +22,24 @@ public enum RecoveryReason: Equatable, Sendable {
         case .pasteRejected: return "Paste didn’t land — not inserted"
         }
     }
+
+    /// The reason alone, for the one-line indicator notice. The full `label` plus "saved to the menu"
+    /// ran ~50 characters and was tail-truncated in the ~300 pt panel, cutting off exactly the part
+    /// that says where the text went.
+    public var shortLabel: String {
+        switch self {
+        case .inserted: return "Inserted"
+        case .focusChanged: return "Focus changed"
+        case .secureField: return "Secure field"
+        case .finalizationTimeout: return "Finalized late"
+        case .noTarget: return "No text field"
+        case .accessibilityMissing: return "Accessibility off"
+        case .pasteRejected: return "Paste didn’t land"
+        }
+    }
+
+    /// The indicator notice for a result routed to the menu.
+    public var notice: String { "\(shortLabel) — saved to menu" }
 }
 
 /// One recoverable result. `text` is a `var` so it can be overwritten on expiry (ORA-REC-003).

@@ -146,6 +146,18 @@ final class OratorKitTests: XCTestCase {
         XCTAssertTrue(HotkeyChord(keyCode: UInt32(kVK_F13), modifiers: 0).isUsableGlobally)
     }
 
+    // The indicator shows a notice on one tail-truncated 12 pt line with ~240 pt to spare in both the
+    // notch and the pill. A recovery notice that truncates hides where the text went.
+    func testRecoveryNoticesFitTheIndicator() {
+        let font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        let reasons: [RecoveryReason] = [.focusChanged, .secureField, .finalizationTimeout, .noTarget,
+                                         .accessibilityMissing, .pasteRejected]
+        for reason in reasons {
+            let width = (reason.notice as NSString).size(withAttributes: [.font: font]).width
+            XCTAssertLessThan(width, 240, "\(reason.notice) is \(Int(width)) pt")
+        }
+    }
+
     // ORA-CFG-002: settings defaults + round-trip via an isolated suite.
     @MainActor
     func testSettingsDefaultsAndPersistence() {
