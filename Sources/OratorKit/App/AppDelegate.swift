@@ -20,10 +20,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     private lazy var statusItem = StatusItemController(coordinator: coordinator)
     private let indicator = IndicatorController()
+    // Carbon delivers hot-key events on the main thread, so toggle runs right here rather than after
+    // a Task hop that could queue the press behind other main-actor work (M1, ORA-PERF-004).
     private lazy var hotkey = HotkeyManager(onFire: { [weak self] in
-        Task { @MainActor in self?.coordinator.toggle() }
+        MainActor.assumeIsolated { self?.coordinator.toggle() }
     })
 
+    /// False when the saved chord couldn't be registered at launch, so Settings can say why the
+    /// hotkey does nothing instead of the failure living only in the log.
+    private var hotkeyRegistered = true
     private var settingsWindow: NSWindow?
     private var onboardingWindow: NSWindow?
     /// The Settings level meter. Owned HERE rather than by the SwiftUI view so that closing the
@@ -35,6 +40,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)   // LSUIElement / no Dock icon (ORA-PLAT-004)
+
+        // Bound every Accessibility call process-wide. An insert makes several synchronous AX calls
+        // on the main actor, and the default timeout is ~6 s each, so one hung host app could freeze
+        // the indicator and the hotkey for most of a minute. A timeout reads as "no answer", which the
+        // insert path already handles (blind paste / unverifiable). 1 s leaves slow-but-alive hosts
+        // like Chrome room to answer.
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 1.0)
 
         // A programmatic main menu (HIG SET-1): without one, standard key equivalents (⌘C/V/X/A,
         // ⌘W…) are dead in the Settings/Onboarding windows. Built with plain NSMenu — the SwiftUI
@@ -53,7 +65,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in Task { @MainActor in await self?.refreshAndWarm() } }
 
-        hotkey.register(Settings.shared.hotkey)
+        hotkeyRegistered = hotkey.register(Settings.shared.hotkey)
         // Full bring-up: readiness → onboarding sync → warm engine. Setup is guided through the
         // crash-free menu-bar menu, not an auto-shown SwiftUI window; the icon reflects not-ready.
         Task { await refreshAndWarm() }
@@ -302,7 +314,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         let view = SettingsView(
             language: language,
             meter: meter,
-            onHotkeyChange: { [weak self] chord in self?.hotkey.register(chord) },
+            hotkeyError: hotkeyRegistered ? nil : SettingsView.hotkeyTakenMessage,
+            onHotkeyChange: { [weak self] chord in
+                let ok = self?.hotkey.register(chord) ?? false
+                if ok { self?.hotkeyRegistered = true }
+                return ok
+            },
             onHotkeyRecording: { [weak self] active in
                 // Suspend the global hotkey while recording so pressing the current combo reaches the
                 // recorder instead of firing Orator; restore it (with whatever chord is now set) after.

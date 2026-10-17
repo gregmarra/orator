@@ -13,7 +13,9 @@ public final class HotkeyManager {
     }
 
     /// Register (or re-register) the chord. Safe to call repeatedly (e.g. after a settings change).
-    public func register(_ chord: HotkeyChord) {
+    /// Returns false when the system refused it — typically another app already owns the chord.
+    @discardableResult
+    public func register(_ chord: HotkeyChord) -> Bool {
         unregister()
         installHandlerIfNeeded()
 
@@ -21,11 +23,12 @@ public final class HotkeyManager {
         var ref: EventHotKeyRef?
         let status = RegisterEventHotKey(chord.keyCode, chord.modifiers, hotKeyID,
                                          GetEventDispatcherTarget(), 0, &ref)
-        if status == noErr {
-            hotKeyRef = ref
-        } else {
+        guard status == noErr else {
             Log.session.error("RegisterEventHotKey failed: \(status)")
+            return false
         }
+        hotKeyRef = ref
+        return true
     }
 
     public func unregister() {

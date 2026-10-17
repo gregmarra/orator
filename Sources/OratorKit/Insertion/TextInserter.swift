@@ -66,8 +66,8 @@ public final class TextInserter {
         // neither AXManualAccessibility (unsupported) nor AXEnhancedUserInterface (not implemented)
         // will turn one on. ⌘V still reaches the app through the responder chain, so we paste blind:
         // no context refinement, no verification, but dictation works there at all.
-        let element = focusedElement()
-        if isSecureField(element) {
+        let field = AXFocusedField.current()
+        if Self.isSecureField(field, globallySecure: SecureInput.isGloballyActive) {
             return .deferredToRecovery(.secureField)          // ORA-INS-007 / E9
         }
 
@@ -76,32 +76,32 @@ public final class TextInserter {
         //    dictation starts a sentence. Both come from one read of the caret context — capitalizing
         //    unconditionally upstream is what made a continuation after "hello," come back as "Hello".
         let delay = target.bundleID.flatMap { Self.settleDelays[$0] }
-        let (preceding, contextSource) = precedingText(element)
+        let composed = Self.compose(text, after: Self.precedingText(field))
+        return await paste(composed.text, settle: delay, field: field)
+    }
+
+    // MARK: Decisions (pure — table-tested against a fake field)
+
+    /// What actually goes into the field: the dictation cased for its position, with a separating
+    /// space when the caret follows a non-space character.
+    struct Composition: Equatable {
+        let text: String
+        let leadingSpace: Bool
+        let startsSentence: Bool
+    }
+
+    nonisolated static func compose(_ text: String, after preceding: String?) -> Composition {
         let startsSentence = SentenceContext.startsSentence(after: preceding)
         var toInsert = startsSentence ? TranscriptCleaner.capitalized(text)
                                       : TranscriptCleaner.continuing(text)
         let leadingSpace = SentenceContext.needsLeadingSpace(after: preceding)
         if leadingSpace { toInsert = " " + toInsert }
-        var shape = InsertShape(build: AppVersion.logStamp, app: target.bundleID, windowTitleTail: windowTitleTail(element, pid: target.pid),
-                                role: copyString(element, kAXRoleAttribute),
-                                subrole: copyString(element, kAXSubroleAttribute),
-                                domID: copyString(element, "AXDOMIdentifier"),
-                                contextSource: contextSource, contextLength: preceding?.utf16.count,
-                                lastCharacter: preceding?.last,
-                                leadingSpace: leadingSpace, startsSentence: startsSentence)
-        let outcome = await paste(toInsert, settle: delay, element: element, shape: &shape)
-        // One shape-only line per insertion, always on: no dictated text and at most ONE character
-        // of the host field, so it is safe to keep in the persistent log and read back weeks later
-        // (`.notice` is the lowest level the unified log keeps on disk). This is how a host that
-        // fakes its focused field — Google Docs hands Chrome a hidden proxy whose value is stale —
-        // gets caught: the line shows which element the decisions in step 3 were made from.
-        Log.insert.notice("Insert shape: \(shape.description, privacy: .public)")
-        return outcome
+        return Composition(text: toInsert, leadingSpace: leadingSpace, startsSentence: startsSentence)
     }
 
     /// How much text before the caret we ask for. We only need the last non-whitespace character, but
     /// a small window absorbs trailing spaces and newlines.
-    private static let contextWindow = 64
+    nonisolated static let contextWindow = 64
 
     /// The text immediately before the caret, or nil when the field won't tell us — which callers
     /// treat as "standalone text" and capitalize.
@@ -111,108 +111,50 @@ public final class TextInserter {
     /// `AXStringForRange` — WhatsApp is exactly this shape: `hasValue=false`, `hasRange=true`.
     /// Reading the whole value therefore failed in apps where the context was perfectly obtainable,
     /// and every dictation there got capitalized as a new sentence. Falls back to the full value for
-    /// fields that answer that instead, and nil for a nil element (E16) — which callers already treat as
+    /// fields that answer that instead, and nil for a nil field (E16) — which callers already treat as
     /// standalone text.
-    ///
-    /// Also reports WHICH read answered, for the insertion shape log — the same context can come from
-    /// three different attributes, and a host that fakes one of them is only identifiable by that.
-    private func precedingText(_ element: AXUIElement?) -> (text: String?, source: InsertShape.ContextSource) {
-        guard let caret = caretLocation(element) else {
-            let value = copyString(element, kAXValueAttribute)
-            return (value, value == nil ? .none : .wholeValue)
-        }
-        guard caret > 0 else { return ("", .caretAtStart) }   // caret at the very start ⇒ empty context
-        let start = max(0, caret - Self.contextWindow)
-        if let window = stringForRange(element, location: start, length: caret - start) { return (window, .range) }
+    nonisolated static func precedingText(_ field: FocusedField?) -> String? {
+        guard let field else { return nil }
+        guard let caret = field.caretLocation else { return field.value }
+        guard caret > 0 else { return "" }                    // caret at the very start ⇒ empty context
+        let start = max(0, caret - contextWindow)
+        if let window = field.string(forRange: start, length: caret - start) { return window }
         // Parameterized read unsupported ⇒ fall back to slicing the full value, if we can get it.
-        guard let text = copyString(element, kAXValueAttribute) else { return (nil, .none) }
+        guard let text = field.value else { return nil }
         let units = Array(text.utf16)                          // AX offsets are UTF-16
         let end = min(caret, units.count)                      // clamp: a stale caret can outrun the value
-        return (String(decoding: units[0..<end], as: UTF16.self), .valueSlice)
-    }
-
-    /// The tail of the focused window's title — the part after the last " - ", which is where web
-    /// apps put their product name ("… - Google Docs"). Only the tail is kept so a document name
-    /// never reaches the log. Falls back to the app's focused window when there is no element.
-    private func windowTitleTail(_ element: AXUIElement?, pid: pid_t) -> String? {
-        var windowRef: CFTypeRef?
-        if let element {
-            _ = AXUIElementCopyAttributeValue(element, kAXWindowAttribute as CFString, &windowRef)
-        }
-        if windowRef == nil {
-            let app = AXUIElementCreateApplication(pid)
-            _ = AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &windowRef)
-        }
-        guard let windowRef, CFGetTypeID(windowRef) == AXUIElementGetTypeID(),
-              let title = copyString((windowRef as! AXUIElement), kAXTitleAttribute) else { return nil }
-        return InsertShape.titleTail(of: title)
-    }
-
-    /// Caret offset (UTF-16) within the focused element, if it reports one.
-    private func caretLocation(_ element: AXUIElement?) -> Int? {
-        guard let element else { return nil }
-        var rangeRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
-              let axRange = rangeRef, CFGetTypeID(axRange) == AXValueGetTypeID() else { return nil }
-        var caret = CFRange()
-        guard AXValueGetValue((axRange as! AXValue), .cfRange, &caret), caret.location >= 0 else { return nil }
-        return caret.location
-    }
-
-    /// `AXStringForRange` — the parameterized read that works where `kAXValue` is refused.
-    private func stringForRange(_ element: AXUIElement?, location: Int, length: Int) -> String? {
-        guard let element else { return nil }
-        guard length > 0 else { return "" }
-        var range = CFRange(location: location, length: length)
-        guard let parameter = AXValueCreate(.cfRange, &range) else { return nil }
-        var result: CFTypeRef?
-        guard AXUIElementCopyParameterizedAttributeValue(
-                element, kAXStringForRangeParameterizedAttribute as CFString, parameter, &result) == .success
-        else { return nil }
-        return result as? String
-    }
-
-    // MARK: Focused-field inspection
-
-    private func focusedElement() -> AXUIElement? {
-        let system = AXUIElementCreateSystemWide()
-        var focused: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
-              let element = focused, CFGetTypeID(element) == AXUIElementGetTypeID()
-        else { return nil }
-        return (element as! AXUIElement)   // guarded by the type-id check above
+        return String(decoding: units[0..<end], as: UTF16.self)
     }
 
     /// A secure field (password) or globally-active secure input refuses programmatic paste. Anything
     /// else focused is treated as editable: paste is the real test (browser/web-view fields often don't
     /// advertise settable AX attributes yet still accept ⌘V), and the recovery buffer is the safety net
     /// if it lands nowhere (M4).
-    private func isSecureField(_ axElement: AXUIElement?) -> Bool {
-        // True when the focused field advertises the AXSecureTextField subrole, or when secure input is
-        // engaged globally (e.g. a password prompt open elsewhere, E10). Both refuse programmatic paste.
-        // With no element the subrole read yields nil, leaving global secure input as the only surviving
-        // signal — a narrowing ORA-INS-007 sanctions explicitly, along with the risk it accepts.
-        copyString(axElement, kAXSubroleAttribute) == (kAXSecureTextFieldSubrole as String)
-            || SecureInput.isGloballyActive
+    ///
+    /// True when the focused field advertises the AXSecureTextField subrole, or when secure input is
+    /// engaged globally (e.g. a password prompt open elsewhere, E10). Both refuse programmatic paste.
+    /// With no field there is no subrole, leaving global secure input as the only surviving signal — a
+    /// narrowing ORA-INS-007 sanctions explicitly, along with the risk it accepts.
+    nonisolated static func isSecureField(_ field: FocusedField?,
+                                          globallySecure: @autoclosure () -> Bool) -> Bool {
+        field?.subrole == (kAXSecureTextFieldSubrole as String) || globallySecure()
     }
 
-    /// The three AX leaf readers all take an OPTIONAL element and answer nil for a nil one, so "the host
-    /// publishes no accessibility tree" (E16) collapses into the same "this field won't tell us" answer
-    /// every caller already handles. Keeping the nil check here rather than in each consumer is what lets
-    /// `precedingText`, `isSecureField`, and `paste` stay written as though an element always existed.
-    private func copyString(_ element: AXUIElement?, _ attr: String) -> String? {
-        guard let element else { return nil }
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attr as CFString, &value) == .success else { return nil }
-        return value as? String
+    /// Success or recovery, from what verification could see.
+    ///
+    /// Only claim rejection when the field's value was actually READABLE — an unreadable field (many
+    /// browser/web-view inputs) is unverifiable, not failed, and must not raise a false alarm. A nil
+    /// field (E16) lands here too: `preValue` is read from that field, so it is nil whenever the
+    /// field is, and the blind paste counts as inserted.
+    nonisolated static func pasteOutcome(preValue: String?, landed: Bool) -> InsertionOutcome {
+        if preValue != nil, !landed { return .deferredToRecovery(.pasteRejected) }
+        return .inserted
     }
 
     // MARK: Paste
 
-    private func paste(_ text: String, settle: Duration?, element: AXUIElement?,
-                       shape: inout InsertShape) async -> InsertionOutcome {
-        let preValue = copyString(element, kAXValueAttribute)   // for best-effort verification
-        shape.valueLengthBefore = preValue?.utf16.count
+    private func paste(_ text: String, settle: Duration?, field: FocusedField?) async -> InsertionOutcome {
+        let preValue = field?.value   // for best-effort verification
         let snapshot = Pasteboard.snapshot()
         let ourChangeCount = Pasteboard.writeConcealed(text)
 
@@ -223,8 +165,7 @@ public final class TextInserter {
         // previously computed and thrown away, so a host that swallowed the synthetic ⌘V (a remapped
         // ⌘V, a modal that stole the keystroke) still reported `.inserted`: success cue, "Inserted" in
         // the menu, and the 5-minute TTL then deleted the only copy (E15 / SPEC §694).
-        let landed = await awaitPasteConsumed(preValue: preValue, element: element)
-        shape.verification = preValue == nil ? .unverifiable : (landed ? .landed : .rejected)
+        let landed = await awaitPasteConsumed(preValue: preValue, field: field)
 
         // Restore on its own task so it never delays the caller's completion cue (ORA-INS-005), after
         // a conservative safety delay when the paste couldn't be confirmed — always guarded by
@@ -235,13 +176,11 @@ public final class TextInserter {
             Pasteboard.restore(snapshot, ifUnchangedFrom: ourChangeCount)
         }
 
-        // Only claim rejection when the field's length was actually READABLE — an unreadable field
-        // (many browser/web-view inputs) is unverifiable, not failed, and must not raise a false alarm.
-        if preValue != nil, !landed {
+        let outcome = Self.pasteOutcome(preValue: preValue, landed: landed)
+        if outcome == .deferredToRecovery(.pasteRejected) {
             Log.insert.notice("Paste not observed in the focused field — routing to recovery")
-            return .deferredToRecovery(.pasteRejected)
         }
-        return .inserted
+        return outcome
     }
 
     /// Poll (bounded) for the focused field's value to CHANGE, confirming the paste landed.
@@ -250,17 +189,18 @@ public final class TextInserter {
     /// selection at least as long as the new text leaves the length equal or smaller. A
     /// length-must-grow test reports those perfectly good pastes as rejected — and re-dictating over
     /// selected text is a normal workflow, not an edge case.
-    private func awaitPasteConsumed(preValue: String?, element: AXUIElement?) async -> Bool {
-        // Not verifiable ⇒ caller uses the safety delay. Covers a nil element too (E16): `preValue` is
-        // read from that same element, so it is already nil whenever the element is.
+    private func awaitPasteConsumed(preValue: String?, field: FocusedField?) async -> Bool {
+        // Not verifiable ⇒ caller uses the safety delay. Covers a nil field too (E16): `preValue` is
+        // read from that same field, so it is already nil whenever the field is.
         guard let preValue else { return false }
         let deadline = ContinuousClock.now.advanced(by: .milliseconds(800))
         while ContinuousClock.now < deadline {
-            if let now = copyString(element, kAXValueAttribute), now != preValue { return true }
+            if let now = field?.value, now != preValue { return true }
             try? await Task.sleep(for: .milliseconds(30))
         }
         return false
     }
+
 
     /// Resolve the key code that types "v" in the **current** keyboard layout, so a synthesized ⌘V
     /// lands as Paste on non-QWERTY layouts (Dvorak, AZERTY, …). Falls back to the ANSI-V physical

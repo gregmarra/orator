@@ -71,6 +71,35 @@ final class SentenceContextTests: XCTestCase {
         XCTAssertFalse(SentenceContext.needsLeadingSpace(after: "a line\n"))
     }
 
+    // MARK: Invisible format characters (Unicode Cf)
+
+    /// Google Docs reports a lone U+200B before the caret in an empty paragraph. Swift's
+    /// `isWhitespace` is false for Cf characters, so they used to read as visible text: a spurious
+    /// leading space in Docs, and "word\u{200B}" treated as a sentence start.
+    func testFormatCharactersAreInvisibleToBothDecisions() {
+        let cases: [(preceding: String, leadingSpace: Bool, startsSentence: Bool)] = [
+            ("\u{200B}", false, true),             // Docs' empty paragraph
+            ("\u{FEFF}", false, true),
+            ("\u{2060}", false, true),
+            ("\u{200B}\u{FEFF}\u{2060}", false, true),
+            ("word\u{200B}", true, false),
+            ("word\u{FEFF}", true, false),
+            ("word\u{2060}", true, false),
+            ("word\u{200B} ", false, false),        // a space after the format char still counts
+            ("Done.\u{200B}", true, true),
+            ("hello,\u{200B}", true, false),
+            ("a paragraph\n\u{200B}", false, true),
+        ]
+        for c in cases {
+            let shown = c.preceding.unicodeScalars.map { String(format: "U+%04X", $0.value) }
+                .joined(separator: " ")
+            XCTAssertEqual(SentenceContext.needsLeadingSpace(after: c.preceding), c.leadingSpace,
+                           "leading space after [\(shown)]")
+            XCTAssertEqual(SentenceContext.startsSentence(after: c.preceding), c.startsSentence,
+                           "sentence start after [\(shown)]")
+        }
+    }
+
     // MARK: Casing policy
 
     /// The recognizer capitalizes the first word of EVERY utterance, so a continuation arrives as

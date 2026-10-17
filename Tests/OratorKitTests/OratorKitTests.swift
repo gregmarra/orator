@@ -121,6 +121,43 @@ final class OratorKitTests: XCTestCase {
         }
     }
 
+    // ORA-INS-005: a password manager's concealed copy is never written back — restoring it would
+    // defeat the manager's timed clear — and the dictated text doesn't linger in its place.
+    @MainActor
+    func testPasteboardDoesNotRestoreSensitiveSnapshot() {
+        withPrivatePasteboard { pb in
+        let secret = NSPasteboardItem()
+        secret.setString("hunter2", forType: .string)
+        secret.setData(Data(), forType: Pasteboard.concealedType)
+        pb.clearContents(); pb.writeObjects([secret])
+        let snapshot = Pasteboard.snapshot()
+        let ourCount = Pasteboard.writeConcealed("dictated")
+        XCTAssertTrue(Pasteboard.restore(snapshot, ifUnchangedFrom: ourCount))
+        XCTAssertNil(pb.string(forType: .string))
+        }
+    }
+
+    // A chord the recorder may save: a plain or ⇧-only key would be claimed from every app.
+    func testHotkeyChordNeedsBlockingModifier() {
+        XCTAssertTrue(HotkeyChord.defaultChord.isUsableGlobally)
+        XCTAssertFalse(HotkeyChord(keyCode: UInt32(kVK_ANSI_A), modifiers: 0).isUsableGlobally)
+        XCTAssertFalse(HotkeyChord(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(shiftKey)).isUsableGlobally)
+        XCTAssertTrue(HotkeyChord(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(controlKey | shiftKey)).isUsableGlobally)
+        XCTAssertTrue(HotkeyChord(keyCode: UInt32(kVK_F13), modifiers: 0).isUsableGlobally)
+    }
+
+    // The indicator shows a notice on one tail-truncated 12 pt line with ~240 pt to spare in both the
+    // notch and the pill. A recovery notice that truncates hides where the text went.
+    func testRecoveryNoticesFitTheIndicator() {
+        let font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        let reasons: [RecoveryReason] = [.focusChanged, .secureField, .finalizationTimeout, .noTarget,
+                                         .accessibilityMissing, .pasteRejected]
+        for reason in reasons {
+            let width = (reason.notice as NSString).size(withAttributes: [.font: font]).width
+            XCTAssertLessThan(width, 240, "\(reason.notice) is \(Int(width)) pt")
+        }
+    }
+
     // ORA-CFG-002: settings defaults + round-trip via an isolated suite.
     @MainActor
     func testSettingsDefaultsAndPersistence() {

@@ -3,6 +3,38 @@ import Foundation
 import Speech
 import Observation
 
+/// Every duration the coordinator's state machine runs on. The defaults ARE production; the struct
+/// exists so tests can shrink them — a 30-minute auto-stop (ORA-SM-010) is otherwise untestable.
+public struct CoordinatorTiming: Sendable {
+    /// Presses closer together than this are one bounced key (ORA-ACT-004).
+    public var debounce: TimeInterval
+    /// The auto-stop cap (ORA-SM-010).
+    public var maxDuration: TimeInterval
+    /// Hard bound on `finalize` (ORA-ASR-003 / M3).
+    public var finalizationCap: Duration
+    /// How long capture may deliver nothing, once it has delivered something, before it counts as
+    /// dead. Comfortably above any normal buffer interval (~10–100 ms).
+    public var captureStallLimit: TimeInterval
+    /// How long a device gets to produce its FIRST buffer before we give up on it.
+    public var captureStartupLimit: TimeInterval
+    /// The recording UI tick: elapsed time, level polling, the watchdog and the auto-stop check.
+    public var tickInterval: Duration
+
+    public init(debounce: TimeInterval = 0.030,
+                maxDuration: TimeInterval = 30 * 60,
+                finalizationCap: Duration = .milliseconds(2500),
+                captureStallLimit: TimeInterval = 2.5,
+                captureStartupLimit: TimeInterval = 8.0,
+                tickInterval: Duration = .milliseconds(100)) {
+        self.debounce = debounce
+        self.maxDuration = maxDuration
+        self.finalizationCap = finalizationCap
+        self.captureStallLimit = captureStallLimit
+        self.captureStartupLimit = captureStartupLimit
+        self.tickInterval = tickInterval
+    }
+}
+
 /// The single owner of the dictation lifecycle (§7.2). Runs on the main actor and processes one
 /// event at a time (ORA-SM-001); audio and engine work happen off-main and deliver results *to*
 /// the coordinator, never mutating its state directly.
@@ -47,15 +79,19 @@ public final class SessionCoordinator: SpeechResultSink {
     // Confirmed accumulator — the sacred text (ORA-SM-002).
     private var confirmedText: String = ""
 
-    // Collaborators. Audio and insertion are protocol-typed so the state machine can be driven
-    // headlessly (see `AudioSource` / `TextInserting`).
+    // Collaborators. Audio, recognition and insertion are protocol-typed so the state machine can be
+    // driven headlessly (see `AudioSource` / `SpeechTranscribing` / `TextInserting`).
     private let audio: any AudioSource
-    private let engine: SpeechEngine
+    private let engine: any SpeechTranscribing
     private let inserter: any TextInserting
     public let recovery: RecoveryBuffer
     private let permissions: PermissionsManager
     private let feedback: SoundFeedback
     private let now: @MainActor () -> Date
+    private let timing: CoordinatorTiming
+    /// Snapshots the frontmost app at start. Injectable because it alone decides whether text that
+    /// cannot be placed is filed as `.noTarget` or `.finalizationTimeout`.
+    private let captureTarget: @MainActor () -> TargetContext?
     private var escapeTap: EscapeTap?
 
     // Session bookkeeping.
@@ -82,16 +118,16 @@ public final class SessionCoordinator: SpeechResultSink {
     /// from "audio arrived but the recognizer returned nothing", which look identical to the user.
     private var peakLevel: Float = 0
 
-    private let debounce: TimeInterval = 0.030            // ORA-ACT-004
-    private let maxDuration: TimeInterval = 30 * 60       // ORA-SM-010
-    private let finalizationCap: Duration = .milliseconds(2500)  // ORA-ASR-003 / M3
-
-    /// `now` is injectable so error-expiry is testable without wall-clock waits (same idiom as
-    /// `RecoveryBuffer`).
-    public init(audio: any AudioSource, engine: SpeechEngine, inserter: any TextInserting,
+    /// `now` is injectable so error-expiry and the debounce are testable without wall-clock waits
+    /// (same idiom as `RecoveryBuffer`); `timing` so the limits are. All default to production.
+    public init(audio: any AudioSource, engine: any SpeechTranscribing, inserter: any TextInserting,
                 recovery: RecoveryBuffer, permissions: PermissionsManager, feedback: SoundFeedback,
-                now: @escaping @MainActor () -> Date = { Date() }) {
+                timing: CoordinatorTiming = CoordinatorTiming(),
+                now: @escaping @MainActor () -> Date = { Date() },
+                captureTarget: @escaping @MainActor () -> TargetContext? = { TargetContext.capture() }) {
         self.now = now
+        self.timing = timing
+        self.captureTarget = captureTarget
         self.audio = audio
         self.engine = engine
         self.inserter = inserter
@@ -245,8 +281,8 @@ public final class SessionCoordinator: SpeechResultSink {
     /// First press starts a dictation; second press stops it (toggle mode). Debounced (ORA-ACT-004),
     /// busy-guarded (ORA-SM-003), and fail-safe when not ready (ORA-PERM-003).
     public func toggle() {
-        let now = Date()
-        if let last = lastToggle, now.timeIntervalSince(last) < debounce { return }
+        let now = self.now()
+        if let last = lastToggle, now.timeIntervalSince(last) < timing.debounce { return }
         lastToggle = now
 
         switch state {
@@ -261,8 +297,8 @@ public final class SessionCoordinator: SpeechResultSink {
                 Log.session.notice("Hotkey ignored: not ready (\(String(describing: self.readiness)))")
                 return
             }
-            starting = true                    // synchronous guard before the async start
-            Task { await startRecording() }
+            starting = true                    // held until the async session attach finishes
+            startRecording()
         case .recording:
             Task { await finish() }
         case .finalizing, .inserting:
@@ -316,15 +352,20 @@ public final class SessionCoordinator: SpeechResultSink {
         feedback.playError()
     }
 
-    private func startRecording() async {
+    /// Synchronous up to capture start, so a hotkey press reaches the microphone with no main-actor
+    /// hop in between (M1, ORA-PERF-004). The engine session attaches afterwards, in `attachSession`.
+    /// Every path out clears `starting`, directly or once its async tail is done.
+    private func startRecording() {
         let began = ContinuousClock.now
-        defer { starting = false }
-        guard state == .idle else { return }
+        guard state == .idle else { starting = false; return }
         guard engine.isWarm, let format = engine.inputFormat else {
             Log.session.error("Cannot start: engine not warm")
-            // A model problem renames itself via readiness; anything else is a transient engine fault.
-            if await downgradeReadinessIfModelUnavailable() { failStart(readiness.shortReason) }
-            else { failStart("Speech engine isn’t ready yet — try again.") }
+            Task {
+                defer { starting = false }
+                // A model problem renames itself via readiness; anything else is a transient engine fault.
+                if await downgradeReadinessIfModelUnavailable() { failStart(readiness.shortReason) }
+                else { failStart("Speech engine isn’t ready — try again") }
+            }
             return
         }
         // TCC mic access can be revoked after launch; capturing without it doesn't throw — it just
@@ -333,7 +374,8 @@ public final class SessionCoordinator: SpeechResultSink {
         guard permissions.microphoneGranted else {
             Log.session.error("Cannot start: microphone permission not granted")
             readiness = .needsPermission(permissions.missing())
-            failStart("Microphone access is off. Enable it in System Settings.")
+            failStart("Mic access is off — see System Settings")
+            starting = false
             return
         }
 
@@ -341,7 +383,7 @@ public final class SessionCoordinator: SpeechResultSink {
         failoverCount = 0
         failedDeviceUIDs = []   // a fresh dictation re-trusts every device
         peakLevel = 0
-        target = TargetContext.capture()
+        target = captureTarget()
         confirmedText = ""
         volatilePreview = ""
         audioLevel = 0
@@ -357,6 +399,7 @@ public final class SessionCoordinator: SpeechResultSink {
             // Capture failed to start ⇒ stay idle, legible reason on every channel (ORA-SM-004 / E5).
             Log.session.error("Audio start failed: \(error.localizedDescription)")
             failStart("Couldn’t start the microphone.")
+            starting = false
             return
         }
 
@@ -367,6 +410,12 @@ public final class SessionCoordinator: SpeechResultSink {
         DebugLog.stage("start→capturing", ms: (ContinuousClock.now - began).milliseconds)   // M1 (ORA-PERF-004)
         feedback.playStart()                                      // non-blocking cue (overlapped)
 
+        Task { await attachSession(stream) }
+    }
+
+    /// The async half of a start: attach a transcription session to the capture already running.
+    private func attachSession(_ stream: AsyncStream<AnalyzerInput>) async {
+        defer { starting = false }
         let token = await engine.beginSession()
 
         // `beginSession` is a suspension point: a second hotkey press during it runs finish() →
@@ -434,7 +483,7 @@ public final class SessionCoordinator: SpeechResultSink {
             await teardownCaptureDraining()   // graceful stop: DRAIN trailing buffers (don't drop them)
         }
 
-        let finished = await engine.finalize(within: finalizationCap)
+        let finished = await engine.finalize(within: timing.finalizationCap)
         DebugLog.stage("stop→final", ms: (ContinuousClock.now - stopped).milliseconds)   // M3
         // Wait until the confirmed accumulator stops growing (the results task delivers the flushed
         // finals asynchronously). State stays `.finalizing` here, so those late finals ARE accepted
@@ -525,10 +574,11 @@ public final class SessionCoordinator: SpeechResultSink {
         return head + tail
     }
 
-    /// Text was saved but not inserted: name the reason on-screen and point at where it went.
+    /// Text was saved but not inserted: name the reason on-screen and point at where it went. Held
+    /// longer than other notices — it is the only sign the text is in the menu, and that expires.
     private func deferredFeedback(_ reason: RecoveryReason) {
         feedback.playError()
-        showNotice("\(reason.label) — saved to the menu")
+        showNotice(reason.notice, for: .seconds(4))
     }
 
     /// A completed dictation that produced no text at all. Silence here reads as a broken app. When
@@ -547,17 +597,18 @@ public final class SessionCoordinator: SpeechResultSink {
 
     // MARK: Auto-stop (ORA-SM-010) + elapsed clock + waveform level
 
-    /// The single 100 ms UI tick while recording: elapsed time, the polled audio level (the tap
-    /// thread just writes a lock-boxed scalar — no per-buffer Tasks), and the max-duration stop.
+    /// The single UI tick (100 ms in production) while recording: elapsed time, the polled audio level
+    /// (the tap thread just writes a lock-boxed scalar — no per-buffer Tasks), and the max-duration stop.
     private func startTicking() {
+        let interval = timing.tickInterval
         tickTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(100))
+                try? await Task.sleep(for: interval)
                 guard let self, let start = self.startInstant else { break }
                 self.elapsed = (ContinuousClock.now - start).milliseconds / 1000   // monotonic seconds
                 self.audioLevel = self.audio.currentLevel
                 self.peakLevel = max(self.peakLevel, self.audioLevel)
-                if self.elapsed >= self.maxDuration {
+                if self.elapsed >= self.timing.maxDuration {
                     // Hand off to a FRESH task and leave the loop. Calling finish() inline ran
                     // the whole stop path inside tickTask — which stopTimersAndTaps cancels — so every
                     // `try? await Task.sleep` on that path threw CancellationError immediately and was
@@ -590,16 +641,10 @@ public final class SessionCoordinator: SpeechResultSink {
         // applying the steady-state limit there kills a microphone that was about to work (and then
         // re-opens the same slow device on failover, twice). Once audio has flowed, silence really
         // does mean the device died, so the tight limit applies.
-        let limit = audio.hasDeliveredAudio ? Self.captureStallLimit : Self.captureStartupLimit
+        let limit = audio.hasDeliveredAudio ? timing.captureStallLimit : timing.captureStartupLimit
         guard silent > limit else { return }
         handleCaptureFailure(reason: "Lost the microphone.")
     }
-
-    /// How long capture may deliver nothing, once it has delivered something, before it counts as
-    /// dead. Comfortably above any normal buffer interval (~10–100 ms).
-    private static let captureStallLimit: TimeInterval = 2.5
-    /// How long a device gets to produce its FIRST buffer before we give up on it.
-    private static let captureStartupLimit: TimeInterval = 8.0
 
     /// Discard-path teardown (cancel/abort): drop the bridge — its unconsumed buffers are intentionally
     /// thrown away.
