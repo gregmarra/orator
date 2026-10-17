@@ -410,3 +410,223 @@ final class StatusTooltipPrecedenceTests: XCTestCase {
         XCTAssertEqual(item.tooltipForTesting, "Orator — ready")
     }
 }
+
+/// The engine interleavings the state machine has to survive, driven through `StubEngine` so they run
+/// with NO speech model installed and happen exactly when the test says — which the real analyzer can
+/// never be made to do on demand.
+final class CoordinatorEngineInterleavingTests: XCTestCase {
+
+    /// No debounce (back-to-back presses are the point here) and a fast tick; otherwise production.
+    private static let fast = CoordinatorTiming(debounce: 0, tickInterval: .milliseconds(20))
+    /// A fixed target, so insertion never depends on which app happens to be frontmost.
+    private static let editor: @MainActor () -> TargetContext? = {
+        TargetContext(pid: 1, bundleID: "com.example.editor")
+    }
+
+    @MainActor
+    private func rig(_ engine: StubEngine, timing: CoordinatorTiming = fast,
+                     target: @escaping @MainActor () -> TargetContext? = editor) -> Rig {
+        makeRig(engine: engine, timing: timing, captureTarget: target)
+    }
+
+    /// Start a dictation and wait until it is recording on a live engine session.
+    @MainActor
+    private func startRecording(_ rig: Rig, _ engine: StubEngine) async {
+        rig.coordinator.toggle()
+        await waitFor { engine.liveToken != nil }
+        XCTAssertEqual(rig.coordinator.state, .recording)
+    }
+
+    // ORA-SM-014: the user stops while the start is still parked in `beginSession`. The stop runs to
+    // completion first; when `beginSession` finally returns, the session it started belongs to nobody
+    // and must be reaped, not left holding the model.
+    @MainActor
+    func testStopDuringSuspendedBeginSessionReapsTheOrphan() async {
+        let engine = StubEngine()
+        engine.suspendBegin = true
+        let rig = rig(engine)
+
+        rig.coordinator.toggle()
+        await waitFor { engine.isBeginSuspended }
+        XCTAssertEqual(rig.coordinator.state, .recording, "capture is live before the engine answers")
+
+        rig.coordinator.toggle()                       // stop, while beginSession is still suspended
+        await waitUntilIdle(rig.coordinator)
+        XCTAssertEqual(rig.coordinator.state, .idle)
+        XCTAssertEqual(rig.audio.stopCount, 1)
+
+        engine.resumeBegin()                           // the engine answers into a torn-down session
+        await settle(100)
+
+        XCTAssertEqual(engine.beginCount, 1)
+        XCTAssertNil(engine.liveToken, "the session begun after teardown must be reaped (ORA-SM-014)")
+        XCTAssertEqual(rig.coordinator.state, .idle, "resuming must not revive the stopped dictation")
+        XCTAssertEqual(rig.audio.startCount, 1, "nothing may restart capture on the dead session")
+        XCTAssertTrue(rig.inserter.insertedTexts.isEmpty)
+
+        // …and the coordinator is not wedged: the next press starts a normal dictation.
+        engine.suspendBegin = false
+        await startRecording(rig, engine)
+        XCTAssertEqual(rig.audio.startCount, 2)
+    }
+
+    // A nil `beginSession` with the model INSTALLED is a transient engine fault. It must fail loudly
+    // (ORA-REL-001) without downgrading readiness — `.needsModel` would kill the hotkey and point Setup
+    // at downloading a model that is already there.
+    @MainActor
+    func testFailedBeginWithModelInstalledKeepsReadinessAndExplains() async {
+        let engine = StubEngine()
+        engine.failBegin = true
+        let rig = rig(engine)
+
+        rig.coordinator.toggle()
+        await waitFor { rig.feedback.cues.contains(.error) }
+
+        XCTAssertEqual(rig.coordinator.state, .idle)
+        XCTAssertEqual(rig.coordinator.readiness, .ready, "an installed model must not be blamed")
+        XCTAssertEqual(rig.coordinator.notice, "Couldn’t start transcription.")
+        XCTAssertNotNil(rig.coordinator.recentError)
+        XCTAssertEqual(rig.feedback.cues, [.start, .error])
+        XCTAssertEqual(rig.audio.stopCount, 1, "capture must be released")
+        XCTAssertTrue(rig.recovery.entries.isEmpty)
+    }
+
+    // The contrast: when the model really is gone, the same failure renames itself via readiness.
+    @MainActor
+    func testFailedBeginWithModelMissingDowngradesReadiness() async {
+        let engine = StubEngine()
+        engine.failBegin = true
+        engine.status = .missing
+        let rig = rig(engine)
+
+        rig.coordinator.toggle()
+        await waitFor { rig.feedback.cues.contains(.error) }
+
+        XCTAssertEqual(rig.coordinator.state, .idle)
+        XCTAssertEqual(rig.coordinator.readiness, .needsModel(.missing))
+    }
+
+    // ORA-ASR-003 / E7: finalize times out ⇒ confirmed text PLUS the unfinalized volatile tail go into
+    // the still-focused target, rather than being withheld.
+    @MainActor
+    func testFinalizeTimeoutInsertsTheVolatileTail() async {
+        let engine = StubEngine()
+        engine.finalizeSucceeds = false
+        let rig = rig(engine)
+
+        await startRecording(rig, engine)
+        engine.confirm("hello")
+        engine.revise("world")
+        rig.coordinator.toggle()
+        await waitUntilIdle(rig.coordinator)
+
+        XCTAssertEqual(engine.finalizeCount, 1)
+        XCTAssertEqual(rig.inserter.insertedTexts, ["hello world"], "the tail must not be withheld")
+        XCTAssertEqual(rig.feedback.cues, [.start, .stop])
+        XCTAssertEqual(rig.recovery.entries.first?.reason, .inserted)
+        XCTAssertNil(engine.liveToken)
+    }
+
+    // …and when that text genuinely cannot be placed (no target), it is filed as a finalization
+    // timeout — the reason the user can act on — not as a generic `.noTarget`.
+    @MainActor
+    func testFinalizeTimeoutWithNoTargetIsFiledAsFinalizationTimeout() async {
+        let engine = StubEngine()
+        engine.finalizeSucceeds = false
+        let rig = rig(engine, target: { nil })
+
+        await startRecording(rig, engine)
+        engine.confirm("hello")
+        engine.revise("world")
+        rig.coordinator.toggle()
+        await waitUntilIdle(rig.coordinator)
+
+        XCTAssertTrue(rig.inserter.insertedTexts.isEmpty)
+        XCTAssertEqual(rig.recovery.entries.first?.reason, .finalizationTimeout)
+        XCTAssertEqual(rig.recovery.entries.first?.text, "Hello world", "confirmed text plus the tail")
+        XCTAssertEqual(rig.feedback.cues, [.start, .error])
+        XCTAssertNotNil(rig.coordinator.notice)
+    }
+
+    // A final flushed by `finalize` arrives AFTER it returns, during the drain — confirming the very
+    // words still sitting in the volatile tail. They must be inserted exactly once, whether or not
+    // finalize reported success (the timed-out path is the one that appends the tail).
+    @MainActor
+    func testFinalArrivingDuringTheDrainIsInsertedExactlyOnce() async {
+        for finalizeSucceeds in [true, false] {
+            let engine = StubEngine()
+            engine.finalizeSucceeds = finalizeSucceeds
+            let rig = rig(engine)
+            let deliveredIn = StateBox()
+            engine.onFinalize = { [coordinator = rig.coordinator] engine in
+                Task { @MainActor in
+                    deliveredIn.state = coordinator.state
+                    engine.confirm("world")
+                }
+            }
+
+            await startRecording(rig, engine)
+            engine.confirm("hello")
+            engine.revise("world")
+            rig.coordinator.toggle()
+            await waitUntilIdle(rig.coordinator)
+
+            XCTAssertEqual(deliveredIn.state, .finalizing,
+                           "the late final must land inside the drain (finalize ok: \(finalizeSucceeds))")
+            XCTAssertEqual(rig.inserter.insertedTexts, ["hello world"],
+                           "late final must appear exactly once (finalize ok: \(finalizeSucceeds))")
+        }
+    }
+
+    // ORA-SM-010 / E14: the max-duration auto-stop is "as if the user pressed stop" — same insert, same
+    // cue, and the late final from the flush is still collected (it once wasn't: the stop path ran
+    // inside the cancelled tick task, which collapsed the drain to nothing).
+    @MainActor
+    func testAutoStopMatchesAManualStopIncludingALateFinal() async {
+        // The final lands a few ms after finalize returns. Zero delay would slip in even through a
+        // collapsed drain; 5 ms does not, and is well inside a real one.
+        func script(_ engine: StubEngine) {
+            engine.onFinalize = { $0.confirmLater("world", after: .milliseconds(5)) }
+        }
+
+        // Manual stop, as the reference.
+        let manualEngine = StubEngine()
+        script(manualEngine)
+        let manual = rig(manualEngine)
+        await startRecording(manual, manualEngine)
+        manualEngine.confirm("hello")
+        manualEngine.revise("world")
+        manual.coordinator.toggle()
+        await waitUntilIdle(manual.coordinator)
+
+        // Auto-stop at ~0.3 s, with no press at all.
+        var timing = Self.fast
+        timing.maxDuration = 0.3
+        let autoEngine = StubEngine()
+        script(autoEngine)
+        let auto = rig(autoEngine, timing: timing)
+        await startRecording(auto, autoEngine)
+        autoEngine.confirm("hello")
+        autoEngine.revise("world")
+        XCTAssertEqual(auto.coordinator.state, .recording, "must not stop before the cap")
+        await waitUntilIdle(auto.coordinator, timeoutMs: 3000)
+
+        XCTAssertEqual(auto.coordinator.state, .idle, "the cap must end the dictation on its own")
+        XCTAssertGreaterThanOrEqual(auto.coordinator.elapsed, 0.3)
+        XCTAssertEqual(auto.inserter.insertedTexts, ["hello world"], "the late final must be included")
+        XCTAssertEqual(auto.inserter.insertedTexts, manual.inserter.insertedTexts)
+        XCTAssertEqual(auto.feedback.cues, manual.feedback.cues)
+        XCTAssertEqual(auto.feedback.cues, [.start, .stop])
+        XCTAssertEqual(auto.recovery.entries.map(\.reason), manual.recovery.entries.map(\.reason))
+        XCTAssertNil(auto.coordinator.notice, "a clean auto-stop needs no explanation")
+        XCTAssertEqual(autoEngine.finalizeCount, 1)
+        XCTAssertEqual(auto.audio.stopCount, 1)
+        XCTAssertNil(autoEngine.liveToken)
+    }
+}
+
+/// Records the session state at a moment the test can't observe directly.
+@MainActor
+private final class StateBox {
+    var state: SessionState?
+}

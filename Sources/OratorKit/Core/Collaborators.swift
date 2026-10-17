@@ -47,5 +47,36 @@ public protocol TextInserting: AnyObject {
                 accessibilityGranted: Bool) async -> InsertionOutcome
 }
 
+/// The recognizer `SessionCoordinator` drives — exactly the slice of `SpeechEngine` it uses, and no
+/// more (model install, locale switching and warm-up stay on the concrete engine, owned by the app).
+///
+/// A protocol so the coordinator's tests no longer depend on the on-device model: without the en-US
+/// asset every coordinator test used to skip silently, and even with it the riskiest engine
+/// interleavings — a `beginSession` still suspended when the user stops, a `finalize` that times out,
+/// a final that lands mid-drain — could not be produced on demand. `Sendable` because the audio bridge
+/// captures it into a detached task to call `feed` (which is also why `SpeechEngine` declares the
+/// conformance in its own file: a Sendable conformance can't be added retroactively).
+@MainActor
+public protocol SpeechTranscribing: AnyObject, Sendable {
+    /// Model resident and input format known, so a session can start without a load.
+    var isWarm: Bool { get }
+    /// The format capture must convert to; nil until warm.
+    var inputFormat: AVAudioFormat? { get }
+    /// Receives results in order (ORA-CC-003). Held weakly by the real engine.
+    var sink: SpeechResultSink? { get set }
+
+    func modelStatus() async -> ModelStatus
+    /// Start one dictation's session; nil means it could NOT be started and must be treated as a
+    /// failed start (ORA-REL-001).
+    func beginSession() async -> SpeechEngine.SessionToken?
+    /// Feed one converted buffer from the audio bridge, off the main actor. Buffers carrying a token
+    /// other than the live session's are dropped.
+    nonisolated func feed(_ input: AnalyzerInput, for token: SpeechEngine.SessionToken)
+    /// Flush the volatile tail under `cap`; `false` means it timed out (ORA-ASR-003).
+    func finalize(within cap: Duration) async -> Bool
+    /// Tear down whatever session is live now.
+    func endSession()
+}
+
 extension AudioCapture: AudioSource {}
 extension TextInserter: TextInserting {}
