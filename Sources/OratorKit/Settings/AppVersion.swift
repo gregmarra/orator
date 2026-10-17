@@ -35,13 +35,6 @@ public enum AppVersion {
         return line
     }
 
-    /// Compact stamp for log lines, e.g. `30·8cea807`, so a line read back weeks later can be tied to
-    /// the build that wrote it — dev builds change under the log several times a week. Nil when unstamped.
-    public static var logStamp: String? {
-        guard build != nil || revision != nil else { return nil }
-        return "\(build ?? "?")·\(revision ?? "?")"
-    }
-
     /// Non-empty string for `key`, or nil. Treats the un-stamped placeholder as absent so an
     /// unstamped bundle shows nothing rather than the word "unknown".
     private static func value(_ key: String) -> String? {
