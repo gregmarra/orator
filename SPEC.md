@@ -492,7 +492,8 @@ Invariants (all MUST):
   best-effort in that case, with the residual risk recorded as R13.
 - ORA-INS-008 (SHOULD): When the caret sits immediately after a non-whitespace character, Orator SHOULD prepend
   a single separating space to the inserted text so back-to-back dictations into the same field do not run
-  together. This is best-effort: it reads a short window of text before the caret via Accessibility as a
+  together. No space follows an opening mark — `(`, `[`, `{`, `“`, `‘`, `@`, `#`, `/` — since it belongs to the
+  word after it. This is best-effort: it reads a short window of text before the caret via Accessibility as a
   **ranged** read first (many text areas, WhatsApp among them, refuse to hand over their whole value while
   still reporting the caret, and a whole-value read there came back nil); it falls back to slicing the whole
   value for fields that answer that instead, to the end of the whole value when no caret offset is reported,

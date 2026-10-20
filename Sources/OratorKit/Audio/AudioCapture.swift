@@ -209,7 +209,7 @@ public final class AudioCapture {
     private func beginCapture(outputFormat: AVAudioFormat?,
                               excluding: Set<String>) throws -> AsyncStream<AnalyzerInput> {
         guard !running else { throw CaptureError.sessionStartFailed("already running") }
-        guard let device = chosenDevice(excluding: excluding) else { throw CaptureError.noInputDevice }
+        guard let device = Self.resolveChoice(excluding: excluding).device else { throw CaptureError.noInputDevice }
         let input: AVCaptureDeviceInput
         do { input = try AVCaptureDeviceInput(device: device) }
         catch { throw CaptureError.sessionStartFailed(error.localizedDescription) }
@@ -341,10 +341,6 @@ public final class AudioCapture {
         CoreAudioSupport.isUsableInput(uid: uid) && AVCaptureDevice(uniqueID: uid) != nil
     }
 
-    private func chosenDevice(excluding: Set<String>) -> AVCaptureDevice? {
-        Self.resolveChoice(excluding: excluding).device
-    }
-
     /// Resolve the current `MicSelection` to a device + substitution reason. O(1) Core Audio IPC on the
     /// common (as-selected) path — the hotkey→capture-start hot path — enumerating only on the cold
     /// garbage-default/absent-pin fallback (see `resolveUID`).
@@ -370,21 +366,10 @@ public final class AudioCapture {
                            excluding: Set<String> = []) -> (uid: String?, substituted: Bool) {
         // One place to apply the exclusion, so no branch below can forget it.
         let usable: @MainActor (String) -> Bool = { !excluding.contains($0) && p.isUsable($0) }
-        switch selection {
-        case .automatic:
-            let (uid, fellBack) = automaticUID(using: p, usable: usable)   // fellBack IS the substitution
-            return (uid, fellBack)
-        case .builtIn:
-            if let uid = p.builtInUID(), usable(uid) { return (uid, false) }
-            return (bestUsableUID(using: p, usable: usable), true)   // no built-in → substitute (nil if nothing usable)
-        }
-    }
-
-    /// System default if usable, else the best usable input. `fellBack` is true when the default was
-    /// unusable and we substituted.
-    private static func automaticUID(using p: DeviceProvider,
-                                     usable: @MainActor (String) -> Bool) -> (uid: String?, fellBack: Bool) {
-        if let uid = p.defaultInputUID(), usable(uid) { return (uid, false) }
+        // The selection names one device — the system default, or the built-in. Use it if usable;
+        // otherwise substitute the best usable input (nil if nothing is usable).
+        let preferred = selection == .automatic ? p.defaultInputUID() : p.builtInUID()
+        if let uid = preferred, usable(uid) { return (uid, false) }
         return (bestUsableUID(using: p, usable: usable), true)
     }
 

@@ -15,6 +15,9 @@ enum SentenceContext {
     /// Closing marks that may sit *after* a terminator ("she said 'go.'"), which we look through to
     /// find the punctuation that actually decides the case.
     private static let closers: Set<Character> = ["\"", "'", ")", "]", "}", "”", "’"]
+    /// Marks that attach to the word after them — "(hello", "@name", "#topic", "and/or" — so the
+    /// dictation follows with no space. Straight quotes are left out: they open and close alike.
+    private static let openers: Set<Character> = ["(", "[", "{", "“", "‘", "@", "#", "/"]
 
     /// Should the inserted text begin a new sentence (i.e. get a capital first letter)? (ORA-INS-009)
     ///
@@ -43,10 +46,10 @@ enum SentenceContext {
 
     /// Does the insertion need a separating space, because the caret sits immediately after a
     /// non-whitespace character (ORA-INS-008)? Back-to-back dictations into the same field would
-    /// otherwise run together.
+    /// otherwise run together. An opening mark is the exception: it belongs to the word that follows.
     static func needsLeadingSpace(after preceding: String?) -> Bool {
         guard let preceding = visible(preceding), let last = preceding.last else { return false }
-        return !last.isWhitespace
+        return !last.isWhitespace && !openers.contains(last)
     }
 
     /// The preceding text with its invisible format characters (Unicode general category Cf —

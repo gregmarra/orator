@@ -30,29 +30,12 @@ public struct HotkeyChord: Codable, Equatable, Sendable {
 ///
 /// Resolution is re-evaluated at every record start, so `builtIn` is matched by CoreAudio transport
 /// type each time — it stays "the built-in" across machines rather than freezing a UID.
-public enum MicSelection: Codable, Equatable, Hashable, Sendable {
+public enum MicSelection: String, Codable, Equatable, Hashable, Sendable {
     /// Follow the system default input device (default; respects the user's mic choice, incl. clamshell). Recommended.
     case automatic
     /// Pin the built-in microphone (avoids low-bandwidth Bluetooth HFP paths; resolved by transport type,
     /// so it stays "the built-in" across machines rather than a frozen UID).
     case builtIn
-
-    /// Compact persisted form: "automatic" | "builtIn".
-    var storageValue: String {
-        switch self {
-        case .automatic: return "automatic"
-        case .builtIn: return "builtIn"
-        }
-    }
-
-    /// Anything unrecognized reads as `.automatic` — which also retires any `device:<uid>` value left
-    /// by an older build, landing that install on the system default rather than a dead pin.
-    init(storageValue raw: String) {
-        switch raw {
-        case "builtIn": self = .builtIn
-        default: self = .automatic   // incl. "automatic", legacy "followDefault", and retired "device:<uid>"
-        }
-    }
 }
 
 /// UserDefaults-backed settings with an explicit, defaulted schema (ORA-CFG-002).
@@ -66,7 +49,6 @@ public final class Settings {
     private let defaults: UserDefaults
     private enum Key {
         static let hotkey = "Hotkey"
-        static let micPolicy = "MicPolicy"       // legacy; read-only for migration into micSelection
         static let micSelection = "MicSelection"
         static let localeIdentifier = "LocaleIdentifier"
         static let soundEnabled = "SoundEnabled"
@@ -88,12 +70,11 @@ public final class Settings {
         set { defaults.set(try? JSONEncoder().encode(newValue), forKey: Key.hotkey) }
     }
 
-    /// Reads the legacy "MicPolicy" key too, so an existing install's `followDefault`/`builtIn` choice
-    /// carries over (ORA-CFG-002).
+    /// Anything unrecognized reads as `.automatic` — which also retires any `device:<uid>` value left
+    /// by an older build, landing that install on the system default rather than a dead pin.
     public var micSelection: MicSelection {
-        get { MicSelection(storageValue: defaults.string(forKey: Key.micSelection)
-                            ?? defaults.string(forKey: Key.micPolicy) ?? "automatic") }
-        set { defaults.set(newValue.storageValue, forKey: Key.micSelection) }
+        get { defaults.string(forKey: Key.micSelection).flatMap(MicSelection.init(rawValue:)) ?? .automatic }
+        set { defaults.set(newValue.rawValue, forKey: Key.micSelection) }
     }
 
     public var localeIdentifier: String {

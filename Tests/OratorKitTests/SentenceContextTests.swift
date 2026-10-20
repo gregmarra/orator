@@ -71,6 +71,16 @@ final class SentenceContextTests: XCTestCase {
         XCTAssertFalse(SentenceContext.needsLeadingSpace(after: "a line\n"))
     }
 
+    func testNoLeadingSpaceAfterAnOpeningMark() {
+        for preceding in ["see (", "[", "{", "“", "‘", "ping @", "#", "and/"] {
+            XCTAssertFalse(SentenceContext.needsLeadingSpace(after: preceding), "'\(preceding)' opens")
+        }
+        // Closers and straight quotes still get the space.
+        for preceding in ["(see)", "\"", "'", "done”"] {
+            XCTAssertTrue(SentenceContext.needsLeadingSpace(after: preceding), "'\(preceding)' doesn't open")
+        }
+    }
+
     // MARK: Invisible format characters (Unicode Cf)
 
     /// Google Docs reports a lone U+200B before the caret in an empty paragraph. Swift's

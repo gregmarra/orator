@@ -169,25 +169,14 @@ final class OratorKitTests: XCTestCase {
         XCTAssertEqual(settings.hotkey, .defaultChord)        // ⌥Space
     }
 
-    // Mic selection persists and migrates the legacy "MicPolicy" key. Round-trips through the compact
-    // storage form. ORA-CAP-002 allows exactly two states — a retired `device:<uid>` pin written by an
+    // Mic selection persists. ORA-CAP-002 allows exactly two states — a retired `device:<uid>` pin written by an
     // older build MUST read back as `.automatic` rather than stranding that install on a dead pin.
     @MainActor
-    func testMicSelectionPersistenceAndMigration() {
-        for sel: MicSelection in [.automatic, .builtIn] {
-            XCTAssertEqual(MicSelection(storageValue: sel.storageValue), sel)
-        }
+    func testMicSelectionPersistence() {
         let suite = UserDefaults(suiteName: "OratorTests-\(UUID().uuidString)")!
         let settings = Settings(defaults: suite)
         settings.micSelection = .builtIn
         XCTAssertEqual(Settings(defaults: suite).micSelection, .builtIn)
-
-        // Legacy MicPolicy values migrate: followDefault → automatic, builtIn → builtIn.
-        let legacy = UserDefaults(suiteName: "OratorTests-\(UUID().uuidString)")!
-        legacy.set("followDefault", forKey: "MicPolicy")
-        XCTAssertEqual(Settings(defaults: legacy).micSelection, .automatic)
-        legacy.set("builtIn", forKey: "MicPolicy")
-        XCTAssertEqual(Settings(defaults: legacy).micSelection, .builtIn)
 
         // The retired per-device pin.
         let pinned = UserDefaults(suiteName: "OratorTests-\(UUID().uuidString)")!
