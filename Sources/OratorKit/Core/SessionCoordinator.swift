@@ -206,11 +206,8 @@ public final class SessionCoordinator: SpeechResultSink {
         teardownCapture()
         engine.endSession()
         if !confirmedText.isEmpty { recovery.add(confirmedText, reason: .noTarget) }
-        confirmedText = ""
-        volatilePreview = ""
         setError(reason)
-        state = .idle
-        sessionToken = nil
+        returnToIdle()
         // An abort that only logged left the user talking into a dead session with no cue and no
         // message. Sound it and hold the reason on-screen briefly (E5 / ORA-REL-001).
         feedback.playError()
@@ -312,13 +309,20 @@ public final class SessionCoordinator: SpeechResultSink {
         guard state == .recording else { return }
         Log.session.notice("Cancel: discarding audio + text, no insertion")
         teardownCapture()
-        confirmedText = ""
-        volatilePreview = ""
         engine.endSession()   // drop unfinalized audio so it can't bleed into the next session
         clearError()          // the user resolved the session deliberately; nothing is wrong now
         clearNotice()
+        returnToIdle()        // no insertion, no recovery entry
+    }
+
+    /// The per-session state every ending clears, whichever way the session ended (cancel, abort,
+    /// finish). Capture and engine teardown differ per path and stay with the caller.
+    private func returnToIdle() {
+        confirmedText = ""
+        volatilePreview = ""
         sessionToken = nil
-        state = .idle             // no insertion, no recovery entry
+        startInstant = nil
+        state = .idle
     }
 
     // MARK: Recording
@@ -500,9 +504,7 @@ public final class SessionCoordinator: SpeechResultSink {
         state = .inserting
         await insert(finalText, timedOut: !finished, lossReason: lossReason)
         DebugLog.stage("stop→inserted", ms: (ContinuousClock.now - stopped).milliseconds)   // M2
-        state = .idle
-        startInstant = nil
-        sessionToken = nil
+        returnToIdle()
     }
 
     /// Terminal step. Every exit gives the user a DISTINCT signal: the success cue only for a real
