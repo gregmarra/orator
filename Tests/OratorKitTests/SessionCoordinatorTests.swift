@@ -578,6 +578,24 @@ final class CoordinatorEngineInterleavingTests: XCTestCase {
         }
     }
 
+    // The end-of-results signal replaces the poll's fixed floor, but must keep its guarantee: a final
+    // the flush delivers after `finalize` returns is still collected, exactly once.
+    @MainActor
+    func testDrainSignalStillCollectsALateFinal() async {
+        let engine = StubEngine()
+        engine.resultsDrainSignal = true
+        engine.onFinalize = { $0.confirmLater("world", after: .milliseconds(20)) }
+        let rig = rig(engine)
+
+        await startRecording(rig, engine)
+        engine.confirm("hello")
+        engine.revise("world")
+        rig.coordinator.toggle()
+        await waitUntilIdle(rig.coordinator)
+
+        XCTAssertEqual(rig.inserter.insertedTexts, ["hello world"])
+    }
+
     // ORA-SM-010 / E14: the max-duration auto-stop is "as if the user pressed stop" — same insert, same
     // cue, and the late final from the flush is still collected (it once wasn't: the stop path ran
     // inside the cancelled tick task, which collapsed the drain to nothing).

@@ -199,6 +199,17 @@ final class StubEngine: SpeechTranscribing {
         return finalizeSucceeds
     }
 
+    /// When set, the engine reports the real engine's end-of-results signal: `awaitResultsDrained`
+    /// returns once every `confirmLater` delivery has landed. Off by default, so the coordinator
+    /// falls back to polling the drain.
+    var resultsDrainSignal = false
+    private var pendingDeliveries: [Task<Void, Never>] = []
+    func awaitResultsDrained(within cap: Duration) async -> Bool {
+        guard resultsDrainSignal else { return false }
+        for delivery in pendingDeliveries { await delivery.value }
+        return true
+    }
+
     func endSession() {
         endCount += 1
         liveToken = nil
@@ -213,10 +224,10 @@ final class StubEngine: SpeechTranscribing {
     /// coordinator's drain. A small nonzero delay is what tells a real drain (~30 ms+) from one that
     /// collapsed to nothing.
     func confirmLater(_ text: String, after delay: Duration = .zero) {
-        Task { @MainActor [weak self] in
+        pendingDeliveries.append(Task { @MainActor [weak self] in
             if delay > .zero { try? await Task.sleep(for: delay) }
             self?.confirm(text)
-        }
+        })
     }
 }
 

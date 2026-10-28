@@ -509,12 +509,15 @@ public final class SessionCoordinator: SpeechResultSink {
         let finished = await engine.finalize(within: timing.finalizationCap)
         DebugLog.stage("finalize", since: finalizeBegan)
         DebugLog.stage("stop→final", since: stopped)   // M3
-        // Wait until the confirmed accumulator stops growing (the results task delivers the flushed
-        // finals asynchronously). State stays `.finalizing` here, so those late finals ARE accepted
-        // by `speechDidConfirm` — this closes the drop-the-tail race. Bounded ≤ ~250 ms (inside M2).
+        // Wait until every final the flush produced has reached `speechDidConfirm` (the results task
+        // delivers them asynchronously). State stays `.finalizing` here, so those late finals ARE
+        // accepted — this closes the drop-the-tail race. A clean finalize ends the results stream,
+        // which is an exact signal; without it (timeout, or no signal within the bound) fall back to
+        // waiting for the confirmed text to stop growing. Each wait is bounded at 250 ms (inside M2).
         let drainBegan = ContinuousClock.now
-        await drainConfirmed(upTo: .milliseconds(250))
-        DebugLog.stage("drain(poll)", since: drainBegan)
+        let drained = finished ? await engine.awaitResultsDrained(within: .milliseconds(250)) : false
+        if !drained { await drainConfirmed(upTo: .milliseconds(250)) }
+        DebugLog.stage(drained ? "drain(signal)" : "drain(poll)", since: drainBegan)
         if let lastResultAt, lastResultAt > finalizeBegan {
             DebugLog.stage("finalize→lastConfirm", ms: (lastResultAt - finalizeBegan).milliseconds)
         }

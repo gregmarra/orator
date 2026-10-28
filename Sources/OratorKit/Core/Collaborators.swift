@@ -80,6 +80,10 @@ public protocol SpeechTranscribing: AnyObject, Sendable {
     nonisolated func feed(_ input: AnalyzerInput, for token: SpeechEngine.SessionToken)
     /// Flush the volatile tail under `cap`; `false` means it timed out (ORA-ASR-003).
     func finalize(within cap: Duration) async -> Bool
+    /// After a successful `finalize`, wait until every result it flushed has been delivered to the
+    /// sink. `false` means there is no such signal (or it didn't come within `cap`): the caller must
+    /// fall back to polling the confirmed text until it stops growing.
+    func awaitResultsDrained(within cap: Duration) async -> Bool
     /// Tear down whatever session is live now.
     func endSession()
 }

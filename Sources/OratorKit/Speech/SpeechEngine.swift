@@ -319,6 +319,7 @@ public final class SpeechEngine: SpeechTranscribing {
             } catch {
                 Log.speech.error("results stream ended with error: \(error.localizedDescription)")
             }
+            if let began = self?.finalizeBeganAt { DebugLog.stage("finalize→resultsEnded", since: began) }
         }
     }
 
@@ -357,9 +358,23 @@ public final class SpeechEngine: SpeechTranscribing {
         // (as `withTaskGroup` does) blocks forever — which froze the coordinator in `.finalizing`. If
         // the timeout wins we return `false`; the caller parks the tail in recovery and `endSession()`
         // discards the dead analyzer (its `cancelAndFinishNow` is fire-and-forget, so it can't wedge us).
+        //
+        // Finalize AND finish, not just finalize: finishing ends the transcriber's results sequence,
+        // which ends the results task — the exact "every final has been delivered" signal
+        // `awaitResultsDrained` waits on. The analyzer is per-session and torn down right after, so
+        // finishing it here loses nothing.
         return await FinalizeRace.run(timeout: cap) {
-            (try? await analyzer.finalize(through: nil)) != nil
+            (try? await analyzer.finalizeAndFinishThroughEndOfInput()) != nil
         }
+    }
+
+    /// Wait for the results task to deliver everything it has and end — the positive version of the
+    /// coordinator's poll-until-stable drain. Only meaningful after a successful `finalize`, which is
+    /// what ends the results sequence. `false` means the signal didn't come within `cap`, and the
+    /// caller must fall back to polling.
+    public func awaitResultsDrained(within cap: Duration) async -> Bool {
+        guard let task = resultsTask else { return true }
+        return await FinalizeRace.run(timeout: cap) { await task.value; return true }
     }
 
     /// Tear the current session down completely so the NEXT dictation starts on a fresh analyzer.
