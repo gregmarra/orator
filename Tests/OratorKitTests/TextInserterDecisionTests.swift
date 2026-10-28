@@ -163,6 +163,13 @@ final class TextInserterDecisionTests: XCTestCase {
         XCTAssertEqual(TextInserter.pasteOutcome(preValue: TextInserter.verifiableValue(docs), landed: false), .inserted)
     }
 
+    /// Google Sheets' focused element is a 2-character blank text area: likewise unverifiable.
+    func testBlankStandInFieldIsUnverifiable() {
+        XCTAssertNil(TextInserter.verifiableValue(FakeField(caret: 0, value: "\n\n")))
+        XCTAssertNil(TextInserter.verifiableValue(FakeField(caret: 0, value: " \u{200B}")))
+        XCTAssertEqual(TextInserter.verifiableValue(FakeField(caret: 0, value: "\nx")), "\nx")
+    }
+
     /// An empty field, or invisible characters among visible text, is still real text and stays verified.
     func testRealFieldsAreNotStandIns() {
         XCTAssertEqual(TextInserter.verifiableValue(FakeField(caret: 0, value: "")), "")

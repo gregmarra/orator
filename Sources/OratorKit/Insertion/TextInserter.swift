@@ -154,15 +154,16 @@ public final class TextInserter {
     /// The longest value `isStandIn` considers.
     nonisolated static let standInMaxLength = 8
 
-    /// A focused "field" holding nothing but invisible format characters is a stand-in for an editor
-    /// that draws its own text, not the text itself. Google Docs focuses a 2-character all-invisible
-    /// element (caret 1) that never changes, however long after the paste it is read, while the
-    /// document lives elsewhere. Verifying against it raised "Paste didn't land" on every dictation that
-    /// did land, so it is treated like an unreadable field: unverifiable, not failed. A genuinely empty
-    /// field reads "", which is not a stand-in and stays verified.
+    /// A focused "field" holding nothing but a few blank characters (invisible format characters or
+    /// whitespace) is a stand-in for an editor that draws its own text, not the text itself. Google Docs
+    /// focuses a 2-character all-invisible element (caret 1), and Google Sheets a 2-character text area
+    /// (caret 0); neither changes when a paste lands, while the document lives elsewhere. Verifying
+    /// against them raised "Paste didn't land" on dictations that did land, so they are treated like an
+    /// unreadable field: unverifiable, not failed. A genuinely empty field reads "", which is not a
+    /// stand-in and stays verified.
     nonisolated static func isStandIn(_ value: String?) -> Bool {
         guard let value, !value.isEmpty, value.utf16.count <= standInMaxLength else { return false }
-        return SentenceContext.visible(value)?.isEmpty == true
+        return value.unicodeScalars.allSatisfy { $0.properties.isWhitespace || $0.properties.generalCategory == .format }
     }
 
     /// Success or recovery, from what verification could see.
