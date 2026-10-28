@@ -96,11 +96,24 @@ public final class SpeechEngine: SpeechTranscribing {
 
     /// The preview transcriber's analyzer and input — see `makePreviewTranscriber`.
     private struct Preview {
-        let transcriber: SpeechTranscriber
+        let transcriber: PreviewTranscriber
         let analyzer: SpeechAnalyzer
         let stream: AsyncStream<AnalyzerInput>
         let continuation: AsyncStream<AnalyzerInput>.Continuation
     }
+    /// Which module drives the preview: DictationTranscriber when its model is installed for the
+    /// locale, else SpeechTranscriber with `.fastResults`. Decided once at warm-up.
+    private enum PreviewTranscriber {
+        case dictation(DictationTranscriber)
+        case speech(SpeechTranscriber)
+        var module: any SpeechModule {
+            switch self {
+            case .dictation(let t): t
+            case .speech(let t): t
+            }
+        }
+    }
+    private var previewUsesDictation = false
     private var spare: PreparedSession?
     private var preparingSpare = false
 
@@ -176,23 +189,28 @@ public final class SpeechEngine: SpeechTranscribing {
                           attributeOptions: [])
     }
 
-    /// The PREVIEW transcriber: the same model with `.fastResults`, on its own analyzer, fed the same
-    /// audio. Display only — nothing it produces is ever inserted.
+    /// The PREVIEW transcriber, on its own analyzer, fed the same audio. Display only — nothing it
+    /// produces is ever inserted.
     ///
     /// The accurate transcriber works in ~3.8 s chunks of audio: its first result needs ~3.9 s of
     /// speech and later ones arrive in bursts ~3.8 s apart, so the preview stalled for seconds at a
-    /// time. `.fastResults` updates every ~1 s, but costs accuracy — about 8% relative WER on our
-    /// synthesized set, and it once dropped a whole phrase ("double check the accuracy of these
-    /// numbers" → "double check the numbers") — which is why it can only drive the preview.
+    /// time. DictationTranscriber (progressive) shows its first words ~0.5 s into speech and updates
+    /// every ~250 ms; SpeechTranscriber with `.fastResults` needed ~1.08 s and updated in ~1 s bursts
+    /// (measured 2026-10-28, synthesized speech). Either costs accuracy, which is why it can only
+    /// drive the preview — `.fastResults` was about 8% worse relative WER and once dropped a phrase.
+    /// `.fastResults` remains the fallback where the dictation model isn't installed for the locale.
     ///
     /// It MUST have its own analyzer. Sharing one put the accurate module on the fast cadence too, and
     /// its text changed ("band" → "van"). On separate analyzers the accurate transcript was
     /// byte-identical to running it alone (measured 2026-10-28).
-    private func makePreviewTranscriber() -> SpeechTranscriber {
-        SpeechTranscriber(locale: locale,
-                          transcriptionOptions: [],
-                          reportingOptions: [.volatileResults, .fastResults],
-                          attributeOptions: [])
+    private func makePreviewTranscriber() -> PreviewTranscriber {
+        if previewUsesDictation {
+            return .dictation(DictationTranscriber(locale: locale, preset: .progressiveLongDictation))
+        }
+        return .speech(SpeechTranscriber(locale: locale,
+                                         transcriptionOptions: [],
+                                         reportingOptions: [.volatileResults, .fastResults],
+                                         attributeOptions: []))
     }
 
     /// All BCP-47 locale ids the transcriber supports on this device (read dynamically — the Settings
@@ -253,6 +271,8 @@ public final class SpeechEngine: SpeechTranscribing {
         // Reserve the locale so the weights stay in RAM independent of any analyzer's lifetime.
         _ = try? await AssetInventory.reserve(locale: locale)
 
+        let dictationLocales = await DictationTranscriber.installedLocales
+        previewUsesDictation = dictationLocales.contains { $0.identifier(.bcp47) == locale.identifier(.bcp47) }
         self.inputFormat = await SpeechAnalyzer.bestAvailableAudioFormat(
             compatibleWith: [makeSpeechTranscriber()])
         modelReady = true
@@ -284,7 +304,7 @@ public final class SpeechEngine: SpeechTranscribing {
         let transcriber = makePreviewTranscriber()
         let (stream, cont) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .unbounded)
         let analyzer = SpeechAnalyzer(
-            modules: [transcriber],
+            modules: [transcriber.module],
             options: SpeechAnalyzer.Options(priority: .high, modelRetention: .processLifetime))
         do { try await analyzer.prepareToAnalyze(in: format) }
         catch { Log.speech.error("prepare preview failed: \(error.localizedDescription)"); return nil }
@@ -360,7 +380,12 @@ public final class SpeechEngine: SpeechTranscribing {
                 try await preview.analyzer.start(inputSequence: preview.stream)
                 previewAnalyzer = preview.analyzer
                 previewInput = preview.continuation
-                previewTask = makePreviewTask(preview.transcriber.results)
+                switch preview.transcriber {
+                case .dictation(let t):
+                    previewTask = makePreviewTask(t.results) { ($0.isFinal, String($0.text.characters)) }
+                case .speech(let t):
+                    previewTask = makePreviewTask(t.results) { ($0.isFinal, String($0.text.characters)) }
+                }
             } catch {
                 Log.speech.error("preview start failed: \(error.localizedDescription)")
                 preview.continuation.finish()
@@ -397,17 +422,17 @@ public final class SpeechEngine: SpeechTranscribing {
 
     /// The preview consumer: forwards the preview transcriber's whole running transcript (its finals so
     /// far plus the current volatile) for display. Its finals are the preview's own, never confirmed text.
-    private func makePreviewTask(
-        _ results: some AsyncSequence<SpeechTranscriber.Result, any Error> & Sendable
+    private func makePreviewTask<Results: AsyncSequence<R, any Error> & Sendable, R>(
+        _ results: Results, _ read: @escaping @Sendable (R) -> (isFinal: Bool, text: String)
     ) -> Task<Void, Never> {
         Task { [weak self] in
             var finals = ""
             do {
                 for try await result in results {
                     guard let self else { break }
-                    let text = String(result.text.characters)
+                    let (isFinal, text) = read(result)
                     let running = finals.isEmpty ? text : finals + " " + text
-                    if result.isFinal { finals = running }
+                    if isFinal { finals = running }
                     self.sink?.speechDidRevisePreview(running)
                 }
             } catch {
