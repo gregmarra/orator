@@ -376,6 +376,7 @@ public final class SessionCoordinator: SpeechResultSink {
     /// Every path out clears `starting`, directly or once its async tail is done.
     private func startRecording() {
         let began = ContinuousClock.now
+        DebugLog.mark("start")
         guard state == .idle else { starting = false; return }
         guard engine.isWarm, let format = engine.inputFormat else {
             Log.session.error("Cannot start: engine not warm")
@@ -408,7 +409,9 @@ public final class SessionCoordinator: SpeechResultSink {
         lastResultAt = nil
         startBegan = began
         timedFirstBuffer = false
+        let targetBegan = ContinuousClock.now
         target = captureTarget()
+        DebugLog.stage("start.captureTarget", since: targetBegan)
         confirmedText = ""
         volatilePreview = ""
         fastPreview = ""
@@ -419,6 +422,8 @@ public final class SessionCoordinator: SpeechResultSink {
         // concurrently rather than gating it. Resolves FBK-001(SHOULD) vs M1(MUST) toward the MUST:
         // a subtle cue that may bleed slightly is acceptable; a 180 ms stall is not.
         let stream: AsyncStream<AnalyzerInput>
+        let audioBegan = ContinuousClock.now
+        defer { DebugLog.stage("start.audioStart", since: audioBegan) }
         do {
             stream = try audio.start(outputFormat: format)
         } catch {

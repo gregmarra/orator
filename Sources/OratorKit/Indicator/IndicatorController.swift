@@ -52,6 +52,13 @@ public final class IndicatorController {
     /// Honors Reduce Motion: appear at final size, no expansion (ORA-IND-017).
     public func show(content: IndicatorContent) {
         guard !visible else { update(content); return }
+        let showBegan = ContinuousClock.now
+        DebugLog.stage("start→indicatorShow", sinceMark: "start")
+        defer {
+            DebugLog.stage("indicator.show", since: showBegan)
+            // The next main-queue turn comes after this turn's layout and display commit.
+            DispatchQueue.main.async { DebugLog.stage("start→indicatorCommitted", sinceMark: "start") }
+        }
         levels.removeAll(keepingCapacity: true)
         armSpinner(for: .idle)                     // fresh session starts as a flat waveform
         let metrics = NotchMetrics.forScreen(ActiveScreen.current())
@@ -68,6 +75,7 @@ public final class IndicatorController {
         let a11y = A11y(reduceMotion: reduceMotion, increaseContrast: increaseContrast,
                         reduceTransparency: reduceTransparency)
         if a11y != builtA11y {
+            DebugLog.stage("indicator.rootBuild", ms: 0)   // marks a show that (re)built the SwiftUI root
             hosting.rootView = IndicatorRoot(model: model,
                                              increaseContrast: increaseContrast,
                                              reduceMotion: reduceMotion,

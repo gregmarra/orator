@@ -353,6 +353,8 @@ public final class SpeechEngine: SpeechTranscribing {
         // The preview starts after the accurate session, so it can never fail a start; a preview
         // analyzer that won't start just leaves the accurate volatiles driving the preview.
         var previewInput: AsyncStream<AnalyzerInput>.Continuation?
+        let previewBegan = ContinuousClock.now
+        defer { if session.preview != nil { DebugLog.stage("beginSession.previewStart", since: previewBegan) } }
         if let preview = session.preview {
             do {
                 try await preview.analyzer.start(inputSequence: preview.stream)

@@ -219,10 +219,16 @@ public final class AudioCapture {
     private func beginCapture(outputFormat: AVAudioFormat?,
                               excluding: Set<String>) throws -> AsyncStream<AnalyzerInput> {
         guard !running else { throw CaptureError.sessionStartFailed("already running") }
+        let resolveBegan = ContinuousClock.now
         guard let device = Self.resolveChoice(excluding: excluding).device else { throw CaptureError.noInputDevice }
+        DebugLog.stage("capture.resolveDevice", since: resolveBegan)
+        let inputBegan = ContinuousClock.now
         let input: AVCaptureDeviceInput
         do { input = try AVCaptureDeviceInput(device: device) }
         catch { throw CaptureError.sessionStartFailed(error.localizedDescription) }
+        DebugLog.stage("capture.deviceInput", since: inputBegan)
+        let logBegan = ContinuousClock.now
+        defer { DebugLog.stage("capture.restOfStart", since: logBegan) }
         currentDeviceUID = device.uniqueID
         // The single line that answers "which mic, in what format, converting to what?" — the three
         // facts every silent-capture report needs and none of which were previously recoverable.
@@ -266,7 +272,10 @@ public final class AudioCapture {
         nonisolated(unsafe) let captureSession = session
         nonisolated(unsafe) let captureOutput = output
         nonisolated(unsafe) let addedInput = input
+        let queuedAt = ContinuousClock.now
         sessionQueue.async {
+            DebugLog.stage("capture.queueWait", since: queuedAt)
+            let configBegan = ContinuousClock.now
             // No input to remove first: `stop` detaches, `running` gates re-entry, and both run on
             // this same serial queue — so the session always arrives here empty.
             captureSession.beginConfiguration()
@@ -277,7 +286,10 @@ public final class AudioCapture {
                 else { Log.audio.error("Cannot add audio output") }
             }
             captureSession.commitConfiguration()
+            DebugLog.stage("capture.configure", since: configBegan)
+            let runBegan = ContinuousClock.now
             captureSession.startRunning()
+            DebugLog.stage("capture.startRunning", since: runBegan)
         }
         running = true
         observeRuntimeErrors()
