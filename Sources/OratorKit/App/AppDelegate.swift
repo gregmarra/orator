@@ -76,8 +76,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     private func warmEngineIfPossible() async {
         guard !engine.isWarm, await engine.modelStatus() == .installed else { return }
-        do { try await engine.warmUp() }
-        catch { Log.speech.error("warmUp failed: \(error.localizedDescription)") }
+        do {
+            try await engine.warmUp()
+            // Once, after the engine, so it never delays the icon or the model: the first device lookup
+            // and device input cost ~105 ms cold vs ~9 ms warm, which the first dictation used to pay on
+            // the hotkey path. Doesn't open the mic.
+            AudioCapture.prewarm()
+        } catch { Log.speech.error("warmUp failed: \(error.localizedDescription)") }
         await coordinator.refreshReadiness()
     }
 

@@ -196,6 +196,17 @@ public final class AudioCapture {
     /// wearing the name of an existing one, which is the exact confusion it exists to prevent.
     public init(label: String) { self.label = label }
 
+    /// Pay capture's one-time setup at launch rather than on the first dictation's hotkey: the first
+    /// device resolution (~32 ms) and the first `AVCaptureDeviceInput` (~77 ms vs ~10 ms warm) load and
+    /// initialize the capture stack. The input is created and dropped without joining a session, so
+    /// the device never runs and the mic-in-use indicator stays off. Skipped without mic access, so it
+    /// can never raise the permission prompt.
+    public static func prewarm() {
+        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
+              let device = resolveChoice().device else { return }
+        _ = try? AVCaptureDeviceInput(device: device)
+    }
+
     /// Begin capture for a dictation (`AudioSource` conformance).
     public func start(outputFormat: AVAudioFormat,
                       excluding: Set<String> = []) throws -> AsyncStream<AnalyzerInput> {
