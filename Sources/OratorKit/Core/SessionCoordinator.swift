@@ -117,6 +117,15 @@ public final class SessionCoordinator: SpeechResultSink {
     /// Loudest level seen this dictation. Diagnostic only: it separates "the mic delivered silence"
     /// from "audio arrived but the recognizer returned nothing", which look identical to the user.
     private var peakLevel: Float = 0
+    /// Latency instrumentation only (ORA-PERF-004): whether this dictation has produced its first
+    /// volatile / confirmed result yet, so each is timed once from `startInstant`.
+    private var sawFirstVolatile = false
+    private var sawFirstConfirmed = false
+    /// When the recognizer last delivered anything — at stop, the gap says how far behind live it ran.
+    private var lastResultAt: ContinuousClock.Instant?
+    /// When `startRecording` began, and whether this dictation's first mic buffer has been timed yet.
+    private var startBegan: ContinuousClock.Instant?
+    private var timedFirstBuffer = false
 
     /// `now` is injectable so error-expiry and the debounce are testable without wall-clock waits
     /// (same idiom as `RecoveryBuffer`); `timing` so the limits are. All default to production.
@@ -387,6 +396,11 @@ public final class SessionCoordinator: SpeechResultSink {
         failoverCount = 0
         failedDeviceUIDs = []   // a fresh dictation re-trusts every device
         peakLevel = 0
+        sawFirstVolatile = false
+        sawFirstConfirmed = false
+        lastResultAt = nil
+        startBegan = began
+        timedFirstBuffer = false
         target = captureTarget()
         confirmedText = ""
         volatilePreview = ""
@@ -411,7 +425,7 @@ public final class SessionCoordinator: SpeechResultSink {
         state = .recording
         startInstant = ContinuousClock.now
         clearError()
-        DebugLog.stage("start→capturing", ms: (ContinuousClock.now - began).milliseconds)   // M1 (ORA-PERF-004)
+        DebugLog.stage("start→capturing", since: began)   // M1 (ORA-PERF-004)
         feedback.playStart()                                      // non-blocking cue (overlapped)
 
         Task { await attachSession(stream) }
@@ -421,6 +435,7 @@ public final class SessionCoordinator: SpeechResultSink {
     private func attachSession(_ stream: AsyncStream<AnalyzerInput>) async {
         defer { starting = false }
         let token = await engine.beginSession()
+        if let startInstant { DebugLog.stage("capturing→session", since: startInstant) }
 
         // `beginSession` is a suspension point: a second hotkey press during it runs finish() →
         // teardownCapture concurrently. If we resumed here on a torn-down session we'd wire an orphan
@@ -480,19 +495,29 @@ public final class SessionCoordinator: SpeechResultSink {
     private func finish(lossReason: String? = nil) async {
         guard state == .recording else { return }
         let stopped = ContinuousClock.now
+        DebugLog.mark("stop")
+        if let lastResultAt { DebugLog.stage("lastResult→stop", since: lastResultAt) }
         state = .finalizing
         if lossReason != nil {
             teardownCapture()             // discard: the device is gone, nothing more will arrive
         } else {
             await teardownCaptureDraining()   // graceful stop: DRAIN trailing buffers (don't drop them)
         }
+        DebugLog.stage("stop→bridgeDrained", since: stopped)
 
+        let finalizeBegan = ContinuousClock.now
         let finished = await engine.finalize(within: timing.finalizationCap)
-        DebugLog.stage("stop→final", ms: (ContinuousClock.now - stopped).milliseconds)   // M3
+        DebugLog.stage("finalize", since: finalizeBegan)
+        DebugLog.stage("stop→final", since: stopped)   // M3
         // Wait until the confirmed accumulator stops growing (the results task delivers the flushed
         // finals asynchronously). State stays `.finalizing` here, so those late finals ARE accepted
         // by `speechDidConfirm` — this closes the drop-the-tail race. Bounded ≤ ~250 ms (inside M2).
+        let drainBegan = ContinuousClock.now
         await drainConfirmed(upTo: .milliseconds(250))
+        DebugLog.stage("drain(poll)", since: drainBegan)
+        if let lastResultAt, lastResultAt > finalizeBegan {
+            DebugLog.stage("finalize→lastConfirm", ms: (lastResultAt - finalizeBegan).milliseconds)
+        }
 
         // Tail read AFTER the drain — see `resolveText`.
         let finalText = TranscriptCleaner.clean(Self.resolveText(confirmed: confirmedText,
@@ -502,8 +527,10 @@ public final class SessionCoordinator: SpeechResultSink {
         engine.endSession()   // drop anything still unfinalized so it can't cross into next session
 
         state = .inserting
+        let insertBegan = ContinuousClock.now
         await insert(finalText, timedOut: !finished, lossReason: lossReason)
-        DebugLog.stage("stop→inserted", ms: (ContinuousClock.now - stopped).milliseconds)   // M2
+        DebugLog.stage("final→inserted", since: insertBegan)
+        DebugLog.stage("stop→inserted", since: stopped)   // M2
         returnToIdle()
     }
 
@@ -610,6 +637,7 @@ public final class SessionCoordinator: SpeechResultSink {
                 self.elapsed = (ContinuousClock.now - start).milliseconds / 1000   // monotonic seconds
                 self.audioLevel = self.audio.currentLevel
                 self.peakLevel = max(self.peakLevel, self.audioLevel)
+                self.timeFirstBuffer()
                 if self.elapsed >= self.timing.maxDuration {
                     // Hand off to a FRESH task and leave the loop. Calling finish() inline ran
                     // the whole stop path inside tickTask — which stopTimersAndTaps cancels — so every
@@ -623,6 +651,15 @@ public final class SessionCoordinator: SpeechResultSink {
                 self.checkCaptureAlive()
             }
         }
+    }
+
+    /// Time from the hotkey reaching `startRecording` to the microphone's first buffer — when capture
+    /// is really live, which `start` returning is not (ORA-PERF-004, M1). Exact despite the 100 ms
+    /// tick: it reads the instant capture stamped, not the tick's own.
+    private func timeFirstBuffer() {
+        guard !timedFirstBuffer, let began = startBegan, let at = audio.firstBufferAt else { return }
+        timedFirstBuffer = true
+        DebugLog.stage("start→firstBuffer", ms: (at - began).milliseconds)
     }
 
     /// Watchdog for capture that dies without an error (ORA-REL-001).
@@ -710,13 +747,25 @@ public final class SessionCoordinator: SpeechResultSink {
 
     public func speechDidConfirm(_ text: String) {
         guard state == .recording || state == .finalizing else { return }
+        noteResult(firstOfKind: &sawFirstConfirmed, "capturing→firstConfirmed")
         confirmedText = Self.joined(confirmedText, text)
         volatilePreview = ""
     }
 
     public func speechDidReviseVolatile(_ text: String) {
         guard state == .recording else { return }
+        noteResult(firstOfKind: &sawFirstVolatile, "capturing→firstVolatile")
         volatilePreview = text
+    }
+
+    /// Latency bookkeeping for a recognizer result (ORA-PERF-004): time the first of each kind from
+    /// capture start, and stamp the latest so stop can report how far the recognizer trailed.
+    private func noteResult(firstOfKind seen: inout Bool, _ stage: String) {
+        let at = ContinuousClock.now
+        lastResultAt = at
+        guard !seen, let startInstant else { return }
+        seen = true
+        DebugLog.stage(stage, ms: (at - startInstant).milliseconds)
     }
 
     // MARK: Indicator content

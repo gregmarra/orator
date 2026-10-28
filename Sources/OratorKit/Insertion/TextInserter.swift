@@ -66,7 +66,9 @@ public final class TextInserter {
         // neither AXManualAccessibility (unsupported) nor AXEnhancedUserInterface (not implemented)
         // will turn one on. ⌘V still reaches the app through the responder chain, so we paste blind:
         // no context refinement, no verification, but dictation works there at all.
+        let axBegan = ContinuousClock.now
         let field = AXFocusedField.current()
+        DebugLog.stage("insert.focusedField", since: axBegan)
         if Self.isSecureField(field, globallySecure: SecureInput.isGloballyActive) {
             return .deferredToRecovery(.secureField)          // ORA-INS-007 / E9
         }
@@ -76,7 +78,9 @@ public final class TextInserter {
         //    dictation starts a sentence. Both come from one read of the caret context — capitalizing
         //    unconditionally upstream is what made a continuation after "hello," come back as "Hello".
         let delay = target.bundleID.flatMap { Self.settleDelays[$0] }
+        let contextBegan = ContinuousClock.now
         let composed = Self.compose(text, after: Self.precedingText(field))
+        DebugLog.stage("insert.caretContext", since: contextBegan)
         return await paste(composed.text, settle: delay, field: field)
     }
 
@@ -154,18 +158,27 @@ public final class TextInserter {
     // MARK: Paste
 
     private func paste(_ text: String, settle: Duration?, field: FocusedField?) async -> InsertionOutcome {
+        let preValueBegan = ContinuousClock.now
         let preValue = field?.value   // for best-effort verification
+        DebugLog.stage("insert.preValue", since: preValueBegan)
+        let snapshotBegan = ContinuousClock.now
         let snapshot = Pasteboard.snapshot()
+        DebugLog.stage("insert.snapshot", since: snapshotBegan)
+        let writeBegan = ContinuousClock.now
         let ourChangeCount = Pasteboard.writeConcealed(text)
+        DebugLog.stage("insert.write", since: writeBegan)
 
         if let settle { try? await Task.sleep(for: settle) }
         postCommandV()
+        DebugLog.stage("stop→⌘V", sinceMark: "stop")
+        let postedAt = ContinuousClock.now
 
         // Wait for the paste to actually land (the focused field's value grew). This result was
         // previously computed and thrown away, so a host that swallowed the synthetic ⌘V (a remapped
         // ⌘V, a modal that stole the keystroke) still reported `.inserted`: success cue, "Inserted" in
         // the menu, and the 5-minute TTL then deleted the only copy (E15 / SPEC §694).
         let landed = await awaitPasteConsumed(preValue: preValue, field: field)
+        DebugLog.stage(landed ? "insert.⌘V→landed" : "insert.⌘V→unverified", since: postedAt)
 
         // Restore on its own task so it never delays the caller's completion cue (ORA-INS-005), after
         // a conservative safety delay when the paste couldn't be confirmed — always guarded by

@@ -26,21 +26,26 @@ private final class CaptureSink: NSObject, AVCaptureAudioDataOutputSampleBufferD
     /// before any conversion so a converter failure still counts as "audio is arriving".
     private let lastBufferBox: OSAllocatedUnfairLock<ContinuousClock.Instant?>
     private let hasDeliveredBox: OSAllocatedUnfairLock<Bool>
+    private let firstBufferBox: OSAllocatedUnfairLock<ContinuousClock.Instant?>
     private let clipBox: OSAllocatedUnfairLock<ContinuousClock.Instant?>
     /// One-shot so a per-buffer failure can't flood the log.
     private var loggedConvertFailure = false
     private var loggedWrapFailure = false
     private var loggedFirstBuffer = false
+    /// When this sink was installed, so the first buffer can report how long the device took to wake.
+    private let installedAt = ContinuousClock.now
 
     init(outputFormat: AVAudioFormat?, levelBox: OSAllocatedUnfairLock<Float>,
          lastBufferBox: OSAllocatedUnfairLock<ContinuousClock.Instant?>,
          hasDeliveredBox: OSAllocatedUnfairLock<Bool>,
+         firstBufferBox: OSAllocatedUnfairLock<ContinuousClock.Instant?>,
          clipBox: OSAllocatedUnfairLock<ContinuousClock.Instant?>,
          yield: @escaping @Sendable (AnalyzerInput) -> Void) {
         self.converter = outputFormat.map(PCMConverter.init(outputFormat:))
         self.levelBox = levelBox
         self.lastBufferBox = lastBufferBox
         self.hasDeliveredBox = hasDeliveredBox
+        self.firstBufferBox = firstBufferBox
         self.clipBox = clipBox
         self.yield = yield
     }
@@ -65,7 +70,8 @@ private final class CaptureSink: NSObject, AVCaptureAudioDataOutputSampleBufferD
         // the delivered format — the three facts every silent-capture report needs.
         if !loggedFirstBuffer {
             loggedFirstBuffer = true
-            Log.audio.notice("First buffer: format=\(pcm.format, privacy: .public) frames=\(pcm.frameLength) rawRMS=\(PCMConverter.rms(pcm), format: .fixed(precision: 4), privacy: .public)")
+            firstBufferBox.withLock { $0 = ContinuousClock.now }
+            Log.audio.notice("First buffer: format=\(pcm.format, privacy: .public) frames=\(pcm.frameLength) afterStart=\((ContinuousClock.now - self.installedAt).milliseconds, format: .fixed(precision: 1), privacy: .public)ms rawRMS=\(PCMConverter.rms(pcm), format: .fixed(precision: 4), privacy: .public)")
         }
         guard let converter else {
             levelBox.withLock { $0 = PCMConverter.rms(pcm) }   // RMS is format-agnostic; no conversion needed
@@ -156,6 +162,10 @@ public final class AudioCapture {
     /// it to pick between the generous startup budget and the tight steady-state one.
     public var hasDeliveredAudio: Bool { hasDeliveredBox.withLock { $0 } }
 
+    /// When this capture's first buffer arrived (latency instrumentation; ORA-PERF-004).
+    private let firstBufferBox = OSAllocatedUnfairLock<ContinuousClock.Instant?>(initialState: nil)
+    public var firstBufferAt: ContinuousClock.Instant? { firstBufferBox.withLock { $0 } }
+
     /// Instant of the most recent clipped buffer, written on the capture queue.
     private let clipBox = OSAllocatedUnfairLock<ContinuousClock.Instant?>(initialState: nil)
     /// True when input hit the rails recently. Clipping is measured on the RAW buffer — it happens at
@@ -224,8 +234,10 @@ public final class AudioCapture {
         // delivers a single buffer is detected on the same timer as one that stops mid-recording.
         lastBufferBox.withLock { $0 = ContinuousClock.now }
         hasDeliveredBox.withLock { $0 = false }
+        firstBufferBox.withLock { $0 = nil }
         let sink = CaptureSink(outputFormat: outputFormat, levelBox: levelBox,
                                lastBufferBox: lastBufferBox, hasDeliveredBox: hasDeliveredBox,
+                               firstBufferBox: firstBufferBox,
                                clipBox: clipBox, yield: { cont.yield($0) })
         self.sink = sink
         output.setSampleBufferDelegate(sink, queue: captureQueue)

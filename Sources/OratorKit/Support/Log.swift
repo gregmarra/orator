@@ -34,6 +34,25 @@ public enum DebugLog {
         Log.session.debug("⏱ \(name, privacy: .public): \(ms, format: .fixed(precision: 1), privacy: .public) ms")
     }
 
+    /// `stage` measured from `start` to now — the shape nearly every call site wants.
+    public static func stage(_ name: String, since start: ContinuousClock.Instant) {
+        stage(name, ms: (ContinuousClock.now - start).milliseconds)
+    }
+
+    /// Named instants for stages that span components which don't otherwise share a clock — the
+    /// coordinator marks "stop", the inserter measures stop→⌘V against it.
+    @MainActor private static var marks: [String: ContinuousClock.Instant] = [:]
+
+    @MainActor public static func mark(_ name: String) {
+        guard isEnabled else { return }
+        marks[name] = ContinuousClock.now
+    }
+
+    @MainActor public static func stage(_ name: String, sinceMark mark: String) {
+        guard let start = marks[mark] else { return }
+        stage(name, since: start)
+    }
+
     /// Records a transcript sample. Marked `.private` so it never leaks in shipped-log captures
     /// even if the developer switch is left on by accident.
     public static func transcript(_ text: String) {
