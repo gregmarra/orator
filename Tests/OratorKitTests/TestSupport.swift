@@ -219,6 +219,8 @@ final class StubEngine: SpeechTranscribing {
     func confirm(_ text: String) { sink?.speechDidConfirm(text) }
     /// Revise the volatile tail now.
     func revise(_ text: String) { sink?.speechDidReviseVolatile(text) }
+    /// Revise the preview transcriber's running transcript now.
+    func preview(_ text: String) { sink?.speechDidRevisePreview(text) }
     /// Deliver a final on a LATER main-actor turn, `delay` from now, the way the real results task
     /// delivers flushed finals after `finalize` returns: called from `onFinalize`, it lands inside the
     /// coordinator's drain. A small nonzero delay is what tells a real drain (~30 ms+) from one that

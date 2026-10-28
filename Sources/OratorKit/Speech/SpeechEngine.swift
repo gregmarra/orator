@@ -12,6 +12,12 @@ public protocol SpeechResultSink: AnyObject {
     func speechDidConfirm(_ text: String)
     /// The current *volatile* tail — replaces the preview; never written to the target field.
     func speechDidReviseVolatile(_ text: String)
+    /// The preview transcriber's whole running transcript — display only, never inserted.
+    func speechDidRevisePreview(_ text: String)
+}
+
+public extension SpeechResultSink {
+    func speechDidRevisePreview(_ text: String) {}
 }
 
 /// A single-resume race: `settle` from whichever of two tasks finishes first resumes the awaiter
@@ -83,6 +89,17 @@ public final class SpeechEngine: SpeechTranscribing {
         let analyzer: SpeechAnalyzer
         let stream: AsyncStream<AnalyzerInput>
         let continuation: AsyncStream<AnalyzerInput>.Continuation
+        /// The preview pipeline; nil if it couldn't be prepared, in which case the accurate
+        /// transcriber's own volatiles drive the preview, as before.
+        let preview: Preview?
+    }
+
+    /// The preview transcriber's analyzer and input — see `makePreviewTranscriber`.
+    private struct Preview {
+        let transcriber: SpeechTranscriber
+        let analyzer: SpeechAnalyzer
+        let stream: AsyncStream<AnalyzerInput>
+        let continuation: AsyncStream<AnalyzerInput>.Continuation
     }
     private var spare: PreparedSession?
     private var preparingSpare = false
@@ -98,6 +115,8 @@ public final class SpeechEngine: SpeechTranscribing {
     private struct ActiveInput: Sendable {
         let token: SessionToken
         let continuation: AsyncStream<AnalyzerInput>.Continuation
+        /// The preview analyzer's input; every buffer goes to both.
+        let previewContinuation: AsyncStream<AnalyzerInput>.Continuation?
         /// Latency instrumentation only (ORA-PERF-004): how much audio actually reached the analyzer,
         /// and when the first of it did — separating "no audio arrived" from "the analyzer was silent".
         var framesFed: Int64 = 0
@@ -106,6 +125,8 @@ public final class SpeechEngine: SpeechTranscribing {
     private let activeInput = OSAllocatedUnfairLock<ActiveInput?>(initialState: nil)
     private var nextSessionID: UInt64 = 0
     private var resultsTask: Task<Void, Never>?
+    private var previewAnalyzer: SpeechAnalyzer?
+    private var previewTask: Task<Void, Never>?
     /// Latency instrumentation only: when the live session started and when its finalize began.
     private var sessionBeganAt: ContinuousClock.Instant?
     private var finalizeBeganAt: ContinuousClock.Instant?
@@ -152,6 +173,25 @@ public final class SpeechEngine: SpeechTranscribing {
         SpeechTranscriber(locale: locale,
                           transcriptionOptions: [],
                           reportingOptions: [.volatileResults],
+                          attributeOptions: [])
+    }
+
+    /// The PREVIEW transcriber: the same model with `.fastResults`, on its own analyzer, fed the same
+    /// audio. Display only — nothing it produces is ever inserted.
+    ///
+    /// The accurate transcriber works in ~3.8 s chunks of audio: its first result needs ~3.9 s of
+    /// speech and later ones arrive in bursts ~3.8 s apart, so the preview stalled for seconds at a
+    /// time. `.fastResults` updates every ~1 s, but costs accuracy — about 8% relative WER on our
+    /// synthesized set, and it once dropped a whole phrase ("double check the accuracy of these
+    /// numbers" → "double check the numbers") — which is why it can only drive the preview.
+    ///
+    /// It MUST have its own analyzer. Sharing one put the accurate module on the fast cadence too, and
+    /// its text changed ("band" → "van"). On separate analyzers the accurate transcript was
+    /// byte-identical to running it alone (measured 2026-10-28).
+    private func makePreviewTranscriber() -> SpeechTranscriber {
+        SpeechTranscriber(locale: locale,
+                          transcriptionOptions: [],
+                          reportingOptions: [.volatileResults, .fastResults],
                           attributeOptions: [])
     }
 
@@ -227,17 +267,28 @@ public final class SpeechEngine: SpeechTranscribing {
     /// hotkey path). Returns nil if the model isn't ready.
     private func makePreparedSession() async -> PreparedSession? {
         guard let format = inputFormat else { return nil }
-        return await prepare(makeSpeechTranscriber(), format: format)
-    }
-
-    private func prepare(_ transcriber: SpeechTranscriber, format: AVAudioFormat) async -> PreparedSession? {
+        async let preview = preparePreview(format: format)
+        let transcriber = makeSpeechTranscriber()
         let (stream, cont) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .unbounded)
         let analyzer = SpeechAnalyzer(
             modules: [transcriber],
             options: SpeechAnalyzer.Options(priority: .high, modelRetention: .processLifetime))
         do { try await analyzer.prepareToAnalyze(in: format) }
         catch { Log.speech.error("prepare spare failed: \(error.localizedDescription)"); return nil }
-        return PreparedSession(transcriber: transcriber, analyzer: analyzer, stream: stream, continuation: cont)
+        return PreparedSession(transcriber: transcriber, analyzer: analyzer, stream: stream,
+                               continuation: cont, preview: await preview)
+    }
+
+    /// Optional by design: a preview that fails to prepare costs only preview latency, never a dictation.
+    private func preparePreview(format: AVAudioFormat) async -> Preview? {
+        let transcriber = makePreviewTranscriber()
+        let (stream, cont) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .unbounded)
+        let analyzer = SpeechAnalyzer(
+            modules: [transcriber],
+            options: SpeechAnalyzer.Options(priority: .high, modelRetention: .processLifetime))
+        do { try await analyzer.prepareToAnalyze(in: format) }
+        catch { Log.speech.error("prepare preview failed: \(error.localizedDescription)"); return nil }
+        return Preview(transcriber: transcriber, analyzer: analyzer, stream: stream, continuation: cont)
     }
 
     /// Prepare the next spare in the background (during idle between dictations) so the next start is
@@ -296,7 +347,24 @@ public final class SpeechEngine: SpeechTranscribing {
         self.analyzer = session.analyzer
         sessionBeganAt = ContinuousClock.now
         finalizeBeganAt = nil
-        activeInput.withLock { $0 = ActiveInput(token: token, continuation: session.continuation) }
+
+        // The preview starts after the accurate session, so it can never fail a start; a preview
+        // analyzer that won't start just leaves the accurate volatiles driving the preview.
+        var previewInput: AsyncStream<AnalyzerInput>.Continuation?
+        if let preview = session.preview {
+            do {
+                try await preview.analyzer.start(inputSequence: preview.stream)
+                previewAnalyzer = preview.analyzer
+                previewInput = preview.continuation
+                previewTask = makePreviewTask(preview.transcriber.results)
+            } catch {
+                Log.speech.error("preview start failed: \(error.localizedDescription)")
+                preview.continuation.finish()
+                Task { await Self.finishBounded(preview.analyzer) }
+            }
+        }
+        let input = ActiveInput(token: token, continuation: session.continuation, previewContinuation: previewInput)
+        activeInput.withLock { $0 = input }
 
         // Per-session results task (ORA-CC-003). Ends when this session is torn down.
         resultsTask = makeResultsTask(session.transcriber.results)
@@ -323,6 +391,27 @@ public final class SpeechEngine: SpeechTranscribing {
         }
     }
 
+    /// The preview consumer: forwards the preview transcriber's whole running transcript (its finals so
+    /// far plus the current volatile) for display. Its finals are the preview's own, never confirmed text.
+    private func makePreviewTask(
+        _ results: some AsyncSequence<SpeechTranscriber.Result, any Error> & Sendable
+    ) -> Task<Void, Never> {
+        Task { [weak self] in
+            var finals = ""
+            do {
+                for try await result in results {
+                    guard let self else { break }
+                    let text = String(result.text.characters)
+                    let running = finals.isEmpty ? text : finals + " " + text
+                    if result.isFinal { finals = running }
+                    self.sink?.speechDidRevisePreview(running)
+                }
+            } catch {
+                Log.speech.debug("preview stream ended: \(error.localizedDescription)")
+            }
+        }
+    }
+
     /// Feed one converted buffer. `nonisolated` so the audio consumer forwards buffers without a
     /// per-buffer main-actor hop. `token` is the one `beginSession` returned for the stream this buffer
     /// came from: a buffer from a torn-down session is dropped rather than yielded into whatever
@@ -331,6 +420,7 @@ public final class SpeechEngine: SpeechTranscribing {
         activeInput.withLock { active in
             guard active?.token == token else { return }
             active?.continuation.yield(input)
+            active?.previewContinuation?.yield(input)
             active?.framesFed += Int64(input.buffer.frameLength)
             if active?.firstFeedAt == nil { active?.firstFeedAt = ContinuousClock.now }
         }
@@ -347,8 +437,13 @@ public final class SpeechEngine: SpeechTranscribing {
         // already drained by the caller, and clearing it here would be indistinguishable from teardown.
         let fed = activeInput.withLock { active in
             active?.continuation.finish()
+            active?.previewContinuation?.finish()
             return active.map { ($0.framesFed, $0.firstFeedAt) }
         }
+        // Recording is over, so the preview has nothing left to show. Its input is already finished
+        // above; stop forwarding its results, but leave its analyzer's teardown to `endSession`, off
+        // the stop path.
+        previewTask?.cancel(); previewTask = nil
         if let (frames, firstAt) = fed, let rate = inputFormat?.sampleRate, rate > 0 {
             DebugLog.stage("audioFed", ms: Double(frames) / rate * 1000)
             if let firstAt, let began = sessionBeganAt { DebugLog.stage("session→firstFeed", ms: (firstAt - began).milliseconds) }
@@ -395,8 +490,16 @@ public final class SpeechEngine: SpeechTranscribing {
     /// teardown and fresh setup never run against the speech daemon concurrently — that concurrency is
     /// what let rapid-fire dictation wedge it. The insert step that follows usually covers the wait,
     /// so the spare is ready by the next start.
+    /// Cancel the preview pipeline (fire-and-forget, bounded): its output is display-only.
+    private func stopPreview() {
+        previewTask?.cancel(); previewTask = nil
+        if let old = previewAnalyzer { Task { await Self.finishBounded(old) } }
+        previewAnalyzer = nil
+    }
+
     private func teardown(queueingSpare: Bool) {
         resultsTask?.cancel(); resultsTask = nil
+        stopPreview()
         finishActiveInput()
         let old = analyzer
         analyzer = nil
@@ -411,6 +514,7 @@ public final class SpeechEngine: SpeechTranscribing {
     private func finishActiveInput() {
         activeInput.withLock { active in
             active?.continuation.finish()
+            active?.previewContinuation?.finish()
             active = nil
         }
     }

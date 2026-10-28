@@ -578,6 +578,29 @@ final class CoordinatorEngineInterleavingTests: XCTestCase {
         }
     }
 
+    // The preview transcriber's text is display only: it drives the indicator but never reaches the
+    // field — not on a clean stop, and not on a timed-out finalize, where the accurate volatile tail
+    // IS inserted (ORA-ASR-003). Its wording differs from the accurate transcript, so letting it in
+    // would put text the accurate model never produced into the user's document.
+    @MainActor
+    func testPreviewTextIsShownButNeverInserted() async {
+        for finalizeSucceeds in [true, false] {
+            let engine = StubEngine()
+            engine.finalizeSucceeds = finalizeSucceeds
+            let rig = rig(engine)
+            await startRecording(rig, engine)
+            engine.confirm("hello")
+            engine.revise("world")
+            engine.preview("hello whirled and more")
+            XCTAssertEqual(rig.coordinator.indicatorContent().previewTail, "hello whirled and more")
+            rig.coordinator.toggle()
+            await waitUntilIdle(rig.coordinator)
+            let placed = rig.inserter.insertedTexts + rig.recovery.entries.map(\.text)
+            XCTAssertFalse(placed.joined().lowercased().contains("whirled"),
+                           "preview text leaked into placed text (finalize ok: \(finalizeSucceeds)): \(placed)")
+        }
+    }
+
     // The end-of-results signal replaces the poll's fixed floor, but must keep its guarantee: a final
     // the flush delivers after `finalize` returns is still collected, exactly once.
     @MainActor

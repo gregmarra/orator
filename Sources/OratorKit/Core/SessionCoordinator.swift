@@ -51,6 +51,10 @@ public final class SessionCoordinator: SpeechResultSink {
     public private(set) var audioLevel: Float = 0
     /// The volatile tail for the live preview only (ORA-ASR-004); never inserted.
     public private(set) var volatilePreview: String = ""
+    /// The preview transcriber's running transcript (see `SpeechEngine.makePreviewTranscriber`).
+    /// Display only, and kept apart from `volatilePreview` on purpose: that one is the accurate
+    /// transcriber's tail, which a timed-out finalize inserts — this text must never reach the field.
+    private var fastPreview: String = ""
     /// A legible reason for the most recent failure (E5), surfaced in the menu tooltip.
     public private(set) var lastError: String?
     /// When `lastError` was set — an error is an *event*, not a standing condition, so it stops being
@@ -120,6 +124,7 @@ public final class SessionCoordinator: SpeechResultSink {
     /// Latency instrumentation only (ORA-PERF-004): whether this dictation has produced its first
     /// volatile / confirmed result yet, so each is timed once from `startInstant`.
     private var sawFirstVolatile = false
+    private var sawFirstPreview = false
     private var sawFirstConfirmed = false
     /// When the recognizer last delivered anything — at stop, the gap says how far behind live it ran.
     private var lastResultAt: ContinuousClock.Instant?
@@ -329,6 +334,7 @@ public final class SessionCoordinator: SpeechResultSink {
     private func returnToIdle() {
         confirmedText = ""
         volatilePreview = ""
+        fastPreview = ""
         sessionToken = nil
         startInstant = nil
         state = .idle
@@ -397,6 +403,7 @@ public final class SessionCoordinator: SpeechResultSink {
         failedDeviceUIDs = []   // a fresh dictation re-trusts every device
         peakLevel = 0
         sawFirstVolatile = false
+        sawFirstPreview = false
         sawFirstConfirmed = false
         lastResultAt = nil
         startBegan = began
@@ -404,6 +411,7 @@ public final class SessionCoordinator: SpeechResultSink {
         target = captureTarget()
         confirmedText = ""
         volatilePreview = ""
+        fastPreview = ""
         audioLevel = 0
         elapsed = 0        // reset BEFORE the indicator expands so it never flashes the prior session's time
 
@@ -761,6 +769,15 @@ public final class SessionCoordinator: SpeechResultSink {
         volatilePreview = text
     }
 
+    public func speechDidRevisePreview(_ text: String) {
+        guard state == .recording else { return }
+        if !sawFirstPreview, let startInstant {
+            sawFirstPreview = true
+            DebugLog.stage("capturing→firstPreview", since: startInstant)
+        }
+        fastPreview = text
+    }
+
     /// Latency bookkeeping for a recognizer result (ORA-PERF-004): time the first of each kind from
     /// capture start, and stamp the latest so stop can report how far the recognizer trailed.
     private func noteResult(firstOfKind seen: inout Bool, _ stage: String) {
@@ -777,7 +794,12 @@ public final class SessionCoordinator: SpeechResultSink {
     /// live text (confirmed + volatile); the panel never resizes (ORA-IND-012). `isNotch` is decided
     /// by the controller from the active screen, so it is left `false` here and overridden there.
     public func indicatorContent() -> IndicatorContent {
-        let tail = [confirmedText, volatilePreview].filter { !$0.isEmpty }.joined(separator: " ")
+        // The preview transcriber runs seconds ahead of the accurate one, so show its transcript once
+        // it has one — never switching back and forth, which would flicker between two wordings. The
+        // accurate text is what gets inserted either way.
+        let tail = fastPreview.isEmpty
+            ? [confirmedText, volatilePreview].filter { !$0.isEmpty }.joined(separator: " ")
+            : fastPreview
         return IndicatorContent(state: state, elapsed: elapsed,
                                 level: audioLevel, previewTail: tail, isNotch: false,
                                 notice: notice)
