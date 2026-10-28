@@ -144,6 +144,27 @@ public final class TextInserter {
         field?.subrole == (kAXSecureTextFieldSubrole as String) || globallySecure()
     }
 
+    /// The value verification compares before and after ⌘V, or nil when the field can't be verified
+    /// (E16, Chromium, a stand-in field).
+    nonisolated static func verifiableValue(_ field: FocusedField?) -> String? {
+        guard let value = field?.value, !isStandIn(value) else { return nil }
+        return value
+    }
+
+    /// The longest value `isStandIn` considers.
+    nonisolated static let standInMaxLength = 8
+
+    /// A focused "field" holding nothing but invisible format characters is a stand-in for an editor
+    /// that draws its own text, not the text itself. Google Docs focuses a 2-character all-invisible
+    /// element (caret 1) that never changes, however long after the paste it is read, while the
+    /// document lives elsewhere. Verifying against it raised "Paste didn't land" on every dictation that
+    /// did land, so it is treated like an unreadable field: unverifiable, not failed. A genuinely empty
+    /// field reads "", which is not a stand-in and stays verified.
+    nonisolated static func isStandIn(_ value: String?) -> Bool {
+        guard let value, !value.isEmpty, value.utf16.count <= standInMaxLength else { return false }
+        return SentenceContext.visible(value)?.isEmpty == true
+    }
+
     /// Success or recovery, from what verification could see.
     ///
     /// Only claim rejection when the field's value was actually READABLE — an unreadable field (many
@@ -159,7 +180,7 @@ public final class TextInserter {
 
     private func paste(_ text: String, settle: Duration?, field: FocusedField?) async -> InsertionOutcome {
         let preValueBegan = ContinuousClock.now
-        let preValue = field?.value   // for best-effort verification
+        let preValue = Self.verifiableValue(field)   // for best-effort verification
         DebugLog.stage("insert.preValue", since: preValueBegan)
         let snapshotBegan = ContinuousClock.now
         let snapshot = Pasteboard.snapshot()

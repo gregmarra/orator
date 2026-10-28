@@ -155,6 +155,22 @@ final class TextInserterDecisionTests: XCTestCase {
         }
     }
 
+    /// Google Docs' focused element is a 2-character run of invisible characters that never changes:
+    /// unverifiable, so a paste that landed doesn't raise "Paste didn't land".
+    func testInvisibleStandInFieldIsUnverifiable() {
+        let docs = FakeField(caret: 1, value: "\u{200B}\u{200B}")
+        XCTAssertNil(TextInserter.verifiableValue(docs))
+        XCTAssertEqual(TextInserter.pasteOutcome(preValue: TextInserter.verifiableValue(docs), landed: false), .inserted)
+    }
+
+    /// An empty field, or invisible characters among visible text, is still real text and stays verified.
+    func testRealFieldsAreNotStandIns() {
+        XCTAssertEqual(TextInserter.verifiableValue(FakeField(caret: 0, value: "")), "")
+        XCTAssertEqual(TextInserter.verifiableValue(FakeField(caret: 3, value: "a\u{200B}b")), "a\u{200B}b")
+        let long = String(repeating: "\u{200B}", count: 9)
+        XCTAssertEqual(TextInserter.verifiableValue(FakeField(caret: 9, value: long)), long)
+    }
+
     /// No focused element (Steam / E16): no preValue can be read, so the blind paste counts as inserted.
     func testNilFieldBlindPasteCountsAsInserted() {
         let field: FocusedField? = nil
