@@ -66,6 +66,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         ) { [weak self] _ in Task { @MainActor in await self?.refreshAndWarm() } }
 
         hotkeyRegistered = hotkey.register(Settings.shared.hotkey)
+        // Pay the indicator's first layout + render now rather than on the first dictation's hotkey:
+        // cold, that first show took ~19 ms on the main thread, warm ~3 ms.
+        indicator.prewarm()
         // Full bring-up: readiness → onboarding sync → warm engine. Setup is guided through the
         // crash-free menu-bar menu, not an auto-shown SwiftUI window; the icon reflects not-ready.
         Task { await refreshAndWarm() }

@@ -107,6 +107,33 @@ public final class IndicatorController {
         visible = true
     }
 
+    /// Pay the panel's first layout and render at launch instead of on the first dictation's hotkey:
+    /// build the SwiftUI root for the current accessibility settings, then order the panel in fully
+    /// transparent for one main-queue turn so AppKit and SwiftUI render it once. Invisible, and gone
+    /// before the next turn. No-op while visible.
+    public func prewarm() {
+        guard !visible else { return }
+        let metrics = NotchMetrics.forScreen(ActiveScreen.current())
+        adoptGeometry(of: metrics)
+        let a11y = A11y(reduceMotion: reduceMotion, increaseContrast: increaseContrast,
+                        reduceTransparency: reduceTransparency)
+        if a11y != builtA11y {
+            hosting.rootView = IndicatorRoot(model: model,
+                                             increaseContrast: increaseContrast,
+                                             reduceMotion: reduceMotion,
+                                             reduceTransparency: reduceTransparency)
+            builtA11y = a11y
+        }
+        position(on: metrics)
+        panel.alphaValue = 0
+        panel.orderFrontRegardless()
+        hosting.layoutSubtreeIfNeeded()
+        hosting.display()
+        DispatchQueue.main.async { [weak self, panel] in
+            MainActor.assumeIsolated { if self?.visible != true { panel.orderOut(nil) } }
+        }
+    }
+
     /// Update content while visible (waveform level, elapsed, preview tail, state).
     private func update(_ content: IndicatorContent) {
         pushLevel(content.level)                   // keep accumulating levels…
