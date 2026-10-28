@@ -298,7 +298,9 @@ public final class SpeechEngine: SpeechTranscribing {
         preparingSpare = true
         Task { [weak self] in
             guard let self else { return }
+            let began = ContinuousClock.now
             let session = await self.makePreparedSession()
+            DebugLog.stage("sparePrepare", since: began)
             self.spare = session
             self.preparingSpare = false
         }
@@ -503,8 +505,12 @@ public final class SpeechEngine: SpeechTranscribing {
         finishActiveInput()
         let old = analyzer
         analyzer = nil
+        let began = ContinuousClock.now
         Task { [weak self] in
-            if let old { await Self.finishBounded(old) }
+            if let old {
+                await Self.finishBounded(old)
+                DebugLog.stage("teardown.oldFinished", since: began)
+            }
             if queueingSpare { self?.ensureSpare() }
         }
     }
