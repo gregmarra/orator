@@ -26,13 +26,23 @@ public class SoundFeedback {
 
     private var enabled: Bool { Settings.shared.soundEnabled }
 
+    /// Every stop/play runs here, never on the main thread: `NSSound.play()` blocks its caller for
+    /// 20–45 ms on EVERY call (measured 2026-10-28), and the start cue sits in the hotkey handler, so it
+    /// held the indicator and the session attach back on each dictation — the stop cue likewise held
+    /// the indicator's close. Off main the call costs ~0.03 ms and the cue sounds just as soon. Serial,
+    /// so a sound is only ever touched by one thread after init.
+    private static let queue = DispatchQueue(label: "com.grgmrr.orator.sound", qos: .userInteractive)
+
     /// Play a cue, restarting it if it's already sounding so rapid dictations don't swallow their own
     /// feedback. Non-blocking: a cue never delays the hotkey→capturing budget (M1 MUST > FBK-001
     /// SHOULD). No-op when the user has sound off.
     private func play(_ sound: NSSound?) {
         guard enabled, let sound else { return }
-        sound.stop()
-        sound.play()
+        nonisolated(unsafe) let cue = sound
+        Self.queue.async {
+            cue.stop()
+            cue.play()
+        }
     }
 
     public func playStart() { play(startSound) }
