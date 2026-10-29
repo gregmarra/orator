@@ -799,12 +799,13 @@ public final class SessionCoordinator: SpeechResultSink {
     /// live text (confirmed + volatile); the panel never resizes (ORA-IND-012). `isNotch` is decided
     /// by the controller from the active screen, so it is left `false` here and overridden there.
     public func indicatorContent() -> IndicatorContent {
-        // The preview transcriber runs seconds ahead of the accurate one, so show its transcript once
-        // it has one — never switching back and forth, which would flicker between two wordings. The
-        // accurate text is what gets inserted either way.
+        // The preview transcriber runs seconds ahead of the accurate one. Once it has text, show the
+        // accurate confirmed words followed by the preview's words past them (`PreviewSplice`), so
+        // earlier words upgrade to the accurate wording as it arrives. The accurate text is what gets
+        // inserted either way.
         let tail = fastPreview.isEmpty
             ? [confirmedText, volatilePreview].filter { !$0.isEmpty }.joined(separator: " ")
-            : fastPreview
+            : PreviewSplice.compose(confirmed: confirmedText, preview: fastPreview)
         return IndicatorContent(state: state, elapsed: elapsed,
                                 level: audioLevel, previewTail: tail, isNotch: false,
                                 notice: notice)
