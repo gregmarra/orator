@@ -21,6 +21,8 @@ public final class IndicatorController {
     /// True while the expand spring is animating; suppresses content re-application so per-tick
     /// updates don't force mid-animation re-renders (frame drops).
     private var expanding = false
+    /// The newest content `update` held back while `expanding`.
+    private var heldContent: IndicatorContent?
     /// Armed here; the delay and its rationale live on `IndicatorMetrics.spinnerActivationDelay`.
     private var spinnerActive = false
     private var spinnerTimer: Timer?
@@ -59,6 +61,7 @@ public final class IndicatorController {
             // The next main-queue turn comes after this turn's layout and display commit.
             DispatchQueue.main.async { DebugLog.stage("start→indicatorCommitted", sinceMark: "start") }
         }
+        heldContent = nil                          // never carry a held update into a new session
         levels.removeAll(keepingCapacity: true)
         armSpinner(for: .idle)                     // fresh session starts as a flat waveform
         let metrics = NotchMetrics.forScreen(ActiveScreen.current())
@@ -101,7 +104,10 @@ public final class IndicatorController {
             DispatchQueue.main.asyncAfter(deadline: .now() + settle) { [weak self] in
                 guard let self else { return }
                 self.expanding = false
-                if self.visible { self.apply(self.model.content) }   // flush latest content once settled
+                // Flush the latest content once settled — what arrived mid-expand, not the content the
+                // panel opened with, which would drop those updates until the next tick.
+                if self.visible { self.apply(self.heldContent ?? self.model.content) }
+                self.heldContent = nil
             }
         }
         visible = true
@@ -141,7 +147,7 @@ public final class IndicatorController {
         armSpinner(for: content.state)
         // …but don't churn model.content mid-expand (see `expanding`); the post-animation flush in
         // `show` applies the latest content once settled.
-        if expanding { return }
+        if expanding { heldContent = content; return }
         apply(content)
     }
 
