@@ -121,6 +121,12 @@ public final class SessionCoordinator: SpeechResultSink {
     /// Loudest level seen this dictation. Diagnostic only: it separates "the mic delivered silence"
     /// from "audio arrived but the recognizer returned nothing", which look identical to the user.
     private var peakLevel: Float = 0
+    /// When the level first reached speech (latency instrumentation), so the preview can be timed from
+    /// speech onset rather than from capture start, which includes the pause before the user speaks.
+    private var speechOnsetAt: ContinuousClock.Instant?
+    private var sawFirstPreviewWords = false
+    /// ≈ −32 dB on the meter's −50 dB-floor scale: above room noise, below normal speech.
+    private static let speechOnsetLevel: Float = 0.35
     /// Latency instrumentation only (ORA-PERF-004): whether this dictation has produced its first
     /// volatile / confirmed result yet, so each is timed once from `startInstant`.
     private var sawFirstVolatile = false
@@ -403,6 +409,8 @@ public final class SessionCoordinator: SpeechResultSink {
         failoverCount = 0
         failedDeviceUIDs = []   // a fresh dictation re-trusts every device
         peakLevel = 0
+        speechOnsetAt = nil
+        sawFirstPreviewWords = false
         sawFirstVolatile = false
         sawFirstPreview = false
         sawFirstConfirmed = false
@@ -653,6 +661,10 @@ public final class SessionCoordinator: SpeechResultSink {
                 self.elapsed = (ContinuousClock.now - start).milliseconds / 1000   // monotonic seconds
                 self.audioLevel = self.audio.currentLevel
                 self.peakLevel = max(self.peakLevel, self.audioLevel)
+                if self.speechOnsetAt == nil, self.audioLevel >= Self.speechOnsetLevel {
+                    self.speechOnsetAt = .now
+                    DebugLog.stage("capturing→speechOnset", since: start)   // ±1 tick (100 ms)
+                }
                 self.timeFirstBuffer()
                 if self.elapsed >= self.timing.maxDuration {
                     // Hand off to a FRESH task and leave the loop. Calling finish() inline ran
@@ -779,6 +791,11 @@ public final class SessionCoordinator: SpeechResultSink {
         if !sawFirstPreview, let startInstant {
             sawFirstPreview = true
             DebugLog.stage("capturing→firstPreview", since: startInstant)
+        }
+        if !sawFirstPreviewWords, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            sawFirstPreviewWords = true
+            if let startInstant { DebugLog.stage("capturing→firstPreviewWords", since: startInstant) }
+            if let speechOnsetAt { DebugLog.stage("speechOnset→firstPreviewWords", since: speechOnsetAt) }
         }
         fastPreview = text
     }
