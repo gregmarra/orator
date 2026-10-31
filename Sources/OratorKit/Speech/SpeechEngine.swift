@@ -132,7 +132,7 @@ public final class SpeechEngine: SpeechTranscribing {
         let previewContinuation: AsyncStream<AnalyzerInput>.Continuation?
         /// Latency instrumentation only (ORA-PERF-004): how much audio actually reached the analyzer,
         /// and when the first of it did — separating "no audio arrived" from "the analyzer was silent".
-        var framesFed: Int64 = 0
+        var secondsFed: Double = 0
         var firstFeedAt: ContinuousClock.Instant?
     }
     private let activeInput = OSAllocatedUnfairLock<ActiveInput?>(initialState: nil)
@@ -450,7 +450,7 @@ public final class SpeechEngine: SpeechTranscribing {
             guard active?.token == token else { return }
             active?.continuation.yield(input)
             active?.previewContinuation?.yield(input)
-            active?.framesFed += Int64(input.buffer.frameLength)
+            active?.secondsFed += input.bufferDuration.seconds
             if active?.firstFeedAt == nil { active?.firstFeedAt = ContinuousClock.now }
         }
     }
@@ -467,14 +467,14 @@ public final class SpeechEngine: SpeechTranscribing {
         let fed = activeInput.withLock { active in
             active?.continuation.finish()
             active?.previewContinuation?.finish()
-            return active.map { ($0.framesFed, $0.firstFeedAt) }
+            return active.map { ($0.secondsFed, $0.firstFeedAt) }
         }
         // Recording is over, so the preview has nothing left to show. Its input is already finished
         // above; stop forwarding its results, but leave its analyzer's teardown to `endSession`, off
         // the stop path.
         previewTask?.cancel(); previewTask = nil
-        if let (frames, firstAt) = fed, let rate = inputFormat?.sampleRate, rate > 0 {
-            DebugLog.stage("audioFed", ms: Double(frames) / rate * 1000)
+        if let (seconds, firstAt) = fed {
+            DebugLog.stage("audioFed", ms: seconds * 1000)
             if let firstAt, let began = sessionBeganAt { DebugLog.stage("session→firstFeed", ms: (firstAt - began).milliseconds) }
         }
         // Race finalize against a HARD timeout, resuming on whichever finishes first WITHOUT awaiting

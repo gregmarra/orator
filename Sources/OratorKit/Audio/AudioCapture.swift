@@ -92,8 +92,7 @@ private final class CaptureSink: NSObject, AVCaptureAudioDataOutputSampleBufferD
 
     /// CMSampleBuffer → AVAudioPCMBuffer in the sample buffer's own format.
     private static func pcmBuffer(from sb: CMSampleBuffer) -> AVAudioPCMBuffer? {
-        guard let fd = CMSampleBufferGetFormatDescription(sb) else { return nil }
-        let format = AVAudioFormat(cmAudioFormatDescription: fd)
+        guard let fd = CMSampleBufferGetFormatDescription(sb), let format = AVAudioFormat(formatDescription: fd) else { return nil }
         let frames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sb))
         guard frames > 0, let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return nil }
         pcm.frameLength = frames
@@ -243,7 +242,7 @@ public final class AudioCapture {
         currentDeviceUID = device.uniqueID
         // The single line that answers "which mic, in what format, converting to what?" — the three
         // facts every silent-capture report needs and none of which were previously recoverable.
-        Log.audio.notice("Capture start [\(self.label, privacy: .public)]: \(device.localizedName, privacy: .public) native=\(AVAudioFormat(cmAudioFormatDescription: device.activeFormat.formatDescription), privacy: .public) target=\(outputFormat?.description ?? "metering (no conversion)", privacy: .public)")
+        Log.audio.notice("Capture start [\(self.label, privacy: .public)]: \(device.localizedName, privacy: .public) native=\(AVAudioFormat(formatDescription: device.activeFormat.formatDescription)?.description ?? "unknown", privacy: .public) target=\(outputFormat?.description ?? "metering (no conversion)", privacy: .public)")
 
         let (stream, cont) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .unbounded)
         continuation = cont

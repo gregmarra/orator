@@ -1,6 +1,6 @@
 # Orator — Product & Engineering Specification
 
-**Version:** 1.0 · **Platform:** macOS 26+ (Apple Silicon)
+**Version:** 1.0 · **Platform:** macOS 27+ (Apple Silicon)
 
 ---
 
@@ -131,8 +131,9 @@ device-specific behavior (e.g. display geometry) **MUST** be derived dynamically
 
 ### 6.1 Platform
 
-- **Deployment target: macOS 26.0, Apple Silicon.** This floor is *forced* by the engine choice: the
-  on-device streaming Speech analyzer/transcriber used here is a macOS-26-era, Swift-only API. There is no
+- **Deployment target: macOS 27.0, Apple Silicon.** The engine choice forces at least macOS 26 (the
+  on-device streaming Speech analyzer/transcriber is a macOS-26-era, Swift-only API); every user is on
+  macOS 27, so the floor tracks the current major release rather than carrying older ones. There is no
   supported fallback engine, and one **MUST NOT** be added to widen compatibility (ORA-PLAT-002).
 - **Language/toolchain:** Current Swift, current Xcode, strict concurrency enabled.
 
@@ -880,13 +881,13 @@ where a seam allows).
 ## 16. Assumptions & Dependencies
 
 - A1. The platform provides an on-device streaming speech analyzer + transcriber with confirmed/volatile
-  results and a managed model-asset inventory on macOS 26 (Apple Silicon).
+  results and a managed model-asset inventory on macOS 26+ (Apple Silicon).
 - A2. The platform exposes focused-element access and programmatic text insertion via the Accessibility API,
   and global hotkey registration via the OS.
 - A3. `SpeechTranscriber` is the more accurate module and ignores `AnalysisContext.contextualStrings`;
   only `DictationTranscriber` honours them (measured 2026-07-30, ORA-VOC-002). Orator runs
   `SpeechTranscriber` unconditionally and offers no vocabulary.
-- A4. The primary user’s Mac and friends’ Macs meet the platform floor (macOS 26, Apple Silicon).
+- A4. The primary user’s Mac and friends’ Macs meet the platform floor (macOS 27, Apple Silicon).
 - A5. Notch geometry is queryable via the documented `NSScreen` APIs.
 
 ---

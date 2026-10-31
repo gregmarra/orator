@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerate the Liquid Glass app icon from source (macOS 26+, no Icon Composer GUI needed).
+# Regenerate the Liquid Glass app icon from source (macOS 27+, no Icon Composer GUI needed).
 #
 # Draws the orange waveform glyph, assembles Resources/AppIcon.icon (icon.json + Assets/), and
 # compiles it with `actool` into Assets.car (the layered Liquid Glass asset) + a fallback
@@ -46,7 +46,7 @@ ok=""
 for attempt in 1 2 3 4 5; do
   rm -rf "$TMP/out"; mkdir -p "$TMP/out"
   ( cd "$TMP" && xcrun actool AppIcon.icon --compile out --app-icon AppIcon --include-all-app-icons \
-      --target-device mac --platform macosx --minimum-deployment-target 26.0 \
+      --target-device mac --platform macosx --minimum-deployment-target 27.0 \
       --output-partial-info-plist out/p.plist >/dev/null 2>&1 ) || true
   if [ -f "$TMP/out/Assets.car" ]; then ok=1; break; fi
   echo "actool attempt $attempt crashed (ibtoold); retrying…"

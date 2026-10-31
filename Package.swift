@@ -1,7 +1,7 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.4
 import PackageDescription
 
-// Orator — menu-bar dictation utility for macOS 26+ (Apple Silicon).
+// Orator — menu-bar dictation utility for macOS 27+ (Apple Silicon).
 // Single app, no third-party runtime dependencies (ORA-PLAT-003 / M6).
 //
 // Layout:
@@ -9,7 +9,7 @@ import PackageDescription
 //   Orator     — the LSUIElement app executable (NSApplication bootstrap)
 let package = Package(
     name: "Orator",
-    platforms: [.macOS("26.0")],
+    platforms: [.macOS("27.0")],
     targets: [
         .target(name: "OratorKit"),
         .executableTarget(name: "Orator", dependencies: ["OratorKit"]),

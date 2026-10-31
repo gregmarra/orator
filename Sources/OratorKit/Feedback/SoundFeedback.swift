@@ -38,10 +38,9 @@ public class SoundFeedback {
     /// SHOULD). No-op when the user has sound off.
     private func play(_ sound: NSSound?) {
         guard enabled, let sound else { return }
-        nonisolated(unsafe) let cue = sound
         Self.queue.async {
-            cue.stop()
-            cue.play()
+            sound.stop()
+            sound.play()
         }
     }
 
