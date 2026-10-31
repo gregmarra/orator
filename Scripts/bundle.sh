@@ -10,11 +10,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CONFIG="${1:-release}"
+# SwiftPM's link step names the SDK but not its version, so ld stamps the binary's SDK version with
+# the deployment target and macOS treats the app as linked against an older SDK (keeping its
+# compatibility behaviours). State both versions to the linker explicitly.
+MIN_OS="$(plutil -extract LSMinimumSystemVersion raw Resources/Info.plist)"
+SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
+LINK_VERSION=(-Xlinker -platform_version -Xlinker macos -Xlinker "$MIN_OS" -Xlinker "$SDK_VERSION")
 APP_DIR="Orator.app"
 
 echo "Building ($CONFIG)..."
-swift build -c "$CONFIG" --product Orator
-BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
+swift build -c "$CONFIG" --product Orator "${LINK_VERSION[@]}"
+BIN_DIR="$(swift build -c "$CONFIG" "${LINK_VERSION[@]}" --show-bin-path)"
 
 echo "Assembling $APP_DIR..."
 rm -rf "$APP_DIR"
