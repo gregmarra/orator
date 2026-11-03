@@ -10,7 +10,7 @@ See [SPEC.md](SPEC.md) for the full product & engineering specification.
 
 ## Build & run
 
-Requires Xcode 27.2 or later (Swift 6.4, macOS 27.2 SDK). If `swift build` can't find an SDK, point the tools at Xcode with `sudo xcode-select -s /Applications/Xcode.app`.
+Building the app needs only the Command Line Tools for macOS 27.2 (`xcode-select --install`); Xcode 27.2 works too. Running the tests needs Xcode, since XCTest ships only with it. If `swift build` can't find an SDK, check `xcode-select -p` points at the Command Line Tools or Xcode.
 
 ```sh
 swift build

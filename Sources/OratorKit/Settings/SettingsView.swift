@@ -5,20 +5,12 @@ import Carbon.HIToolbox
 /// hotkey, language, microphone policy, launch-at-login, sound.
 /// No per-app profiles / workflow editor / model picker / plugins (ORA-CFG-004).
 public struct SettingsView: View {
-    @State private var hotkey: HotkeyChord = Settings.shared.hotkey
-    @State private var micSelection: MicSelection = Settings.shared.micSelection
+    @Bindable private var form: SettingsForm
     /// Live input-level meter for the selected device — READ here, owned by `AppDelegate`. This view
     /// never starts or stops it: a view is not something the microphone's release can depend on
     /// (ORA-CAP-026).
     private let meter: MicLevelMonitor
-    @State private var launchAtLogin: Bool = LaunchAtLogin.isEnabled
-    @State private var soundEnabled: Bool = Settings.shared.soundEnabled
-    @State private var recordingHotkey = false
-    /// Why the last chord couldn't be registered, shown under the recorder until the next try.
-    @State private var hotkeyError: String?
     @Bindable private var language: LanguageModel
-    /// A not-yet-installed language the user picked, awaiting download confirmation.
-    @State private var pendingInstallID: String?
 
     /// Shown when the system refuses a chord, at launch or after recording one.
     public static let hotkeyTakenMessage = "Couldn’t use this shortcut — another app may already have it."
@@ -40,7 +32,7 @@ public struct SettingsView: View {
                 onReset: (() -> Void)? = nil) {
         self._language = Bindable(language)
         self.meter = meter
-        self._hotkeyError = State(initialValue: hotkeyError)
+        self._form = Bindable(SettingsForm(hotkeyError: hotkeyError))
         self.onHotkeyChange = onHotkeyChange
         self.onHotkeyRecording = onHotkeyRecording
         self.onReset = onReset
@@ -50,30 +42,30 @@ public struct SettingsView: View {
         Form {
             Section {
                 LabeledContent("Hotkey") {
-                    HotkeyField(chord: $hotkey, recording: $recordingHotkey) { chord in
+                    HotkeyField(chord: $form.hotkey, recording: $form.recordingHotkey, needsModifier: $form.needsModifier) { chord in
                         // Save only a chord the system accepted. On refusal the view reverts, and the
                         // recorder's end re-registers the still-saved previous chord.
                         if onHotkeyChange?(chord) ?? true {
                             Settings.shared.hotkey = chord
-                            hotkeyError = nil
+                            form.hotkeyError = nil
                         } else {
-                            hotkey = Settings.shared.hotkey
-                            hotkeyError = Self.hotkeyTakenMessage
+                            form.hotkey = Settings.shared.hotkey
+                            form.hotkeyError = Self.hotkeyTakenMessage
                         }
                     }
-                    .onChange(of: recordingHotkey) { _, active in onHotkeyRecording?(active) }
+                    .onChange(of: form.recordingHotkey) { _, active in onHotkeyRecording?(active) }
                 }
-                if let hotkeyError {
+                if let hotkeyError = form.hotkeyError {
                     Text(hotkeyError)
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
                 languageRow
                 micRow
-                Toggle("Play start/stop sounds", isOn: $soundEnabled)
-                    .onChange(of: soundEnabled) { _, v in Settings.shared.soundEnabled = v }
-                Toggle("Launch at login", isOn: $launchAtLogin)
-                    .onChange(of: launchAtLogin) { _, v in LaunchAtLogin.set(v) }
+                Toggle("Play start/stop sounds", isOn: $form.soundEnabled)
+                    .onChange(of: form.soundEnabled) { _, v in Settings.shared.soundEnabled = v }
+                Toggle("Launch at login", isOn: $form.launchAtLogin)
+                    .onChange(of: form.launchAtLogin) { _, v in LaunchAtLogin.set(v) }
             }
 
             Section {
@@ -120,11 +112,11 @@ public struct SettingsView: View {
         // Picker + level bar + status as ONE Form row, so no divider (horizontal rule) separates the
         // bar from the picker it belongs to.
         VStack(alignment: .leading, spacing: 8) {
-        Picker("Microphone", selection: $micSelection) {
+        Picker("Microphone", selection: $form.micSelection) {
             Text("Automatic (system default)").tag(MicSelection.automatic)
             Text("Built-in microphone").tag(MicSelection.builtIn)
         }
-        .onChange(of: micSelection) { _, v in
+        .onChange(of: form.micSelection) { _, v in
             Settings.shared.micSelection = v
             meter.restart()   // preview the newly-selected device immediately
         }
@@ -159,7 +151,7 @@ public struct SettingsView: View {
         MicStatus.text(permissionDenied: meter.permissionDenied,
                        openFailure: meter.openFailure,
                        resolvedName: meter.resolvedName,
-                       selection: micSelection,
+                       selection: form.micSelection,
                        substituted: meter.substituted,
                        clipping: meter.clipping)
     }
@@ -178,20 +170,20 @@ public struct SettingsView: View {
             if language.isInstalled(id) {
                 Task { await language.select?(id) }      // already on-device → switch immediately
             } else {
-                pendingInstallID = id                    // needs a download → confirm first
+                form.pendingInstallID = id               // needs a download → confirm first
             }
         }
         // Confirm before a model download; cancel reverts the picker.
-        .alert("Download the \(language.displayName(pendingInstallID ?? "")) model from Apple?",
-               isPresented: Binding(get: { pendingInstallID != nil },
-                                    set: { if !$0 { pendingInstallID = nil } })) {
+        .alert("Download the \(language.displayName(form.pendingInstallID ?? "")) model from Apple?",
+               isPresented: Binding(get: { form.pendingInstallID != nil },
+                                    set: { if !$0 { form.pendingInstallID = nil } })) {
             Button("Download") {
-                if let id = pendingInstallID { Task { await language.select?(id) } }
-                pendingInstallID = nil
+                if let id = form.pendingInstallID { Task { await language.select?(id) } }
+                form.pendingInstallID = nil
             }
             Button("Cancel", role: .cancel) {
                 language.selectedID = language.appliedID   // revert the picker
-                pendingInstallID = nil
+                form.pendingInstallID = nil
             }
         } message: {
             // Apple's asset API never reports size (progress is a normalized fraction); measured models are ~340–380 MB, so ~350 MB is honest.
@@ -214,6 +206,25 @@ public struct SettingsView: View {
         }
     }
 
+}
+
+/// The pane's editable state. An `@Observable` model rather than `@State` properties because SwiftUI's
+/// `@State` is a macro whose plugin ships only with Xcode, and Orator builds with the Command Line Tools
+/// alone. Created once per Settings window (`AppDelegate` builds the view once and reuses the window).
+@Observable @MainActor
+final class SettingsForm {
+    var hotkey = Settings.shared.hotkey
+    var micSelection = Settings.shared.micSelection
+    var launchAtLogin = LaunchAtLogin.isEnabled
+    var soundEnabled = Settings.shared.soundEnabled
+    var recordingHotkey = false
+    /// Why the last chord couldn't be registered, shown under the recorder until the next try.
+    var hotkeyError: String?
+    /// A not-yet-installed language the user picked, awaiting download confirmation.
+    var pendingInstallID: String?
+    var needsModifier = false
+
+    init(hotkeyError: String?) { self.hotkeyError = hotkeyError }
 }
 
 /// A slim horizontal input-level meter (0…1). Theme-aware via `.tint`/`.quaternary`; the level is
@@ -252,10 +263,9 @@ struct LevelBar: View {
 struct HotkeyField: View {
     @Binding var chord: HotkeyChord
     @Binding var recording: Bool
-    var onChange: (HotkeyChord) -> Void
-
     /// Set when the last key pressed in the recorder had no ⌘, ⌥ or ⌃; recording continues.
-    @State private var needsModifier = false
+    @Binding var needsModifier: Bool
+    var onChange: (HotkeyChord) -> Void
 
     var body: some View {
         // Click to enter "set" mode. Capture view mounts ONLY while recording — never steals key events
