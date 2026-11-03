@@ -219,10 +219,13 @@ public final class TextInserter {
         // Not verifiable ⇒ caller uses the safety delay. Covers a nil field too (E16): `preValue` is
         // read from that same field, so it is already nil whenever the field is.
         guard let preValue else { return false }
+        // Each read is a synchronous AX call on the main actor (~0.1–3 ms; bounded by the 1 s messaging
+        // timeout). The sleep between reads yields the main actor. 10 ms, not 30: the success cue and
+        // the indicator's close wait on this, and a paste usually lands within the first interval.
         let deadline = ContinuousClock.now.advanced(by: .milliseconds(800))
         while ContinuousClock.now < deadline {
             if let now = field?.value, now != preValue { return true }
-            try? await Task.sleep(for: .milliseconds(30))
+            try? await Task.sleep(for: .milliseconds(10))
         }
         return false
     }
