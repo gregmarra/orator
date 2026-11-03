@@ -72,6 +72,10 @@ struct Waveform: View {
     let levels: [Float]
     let level: Float
     let color: Color
+    /// Glide each bar to its new height over one level tick, so the bars move at the display's refresh
+    /// rate (Core Animation interpolates) while the level is still read only every 100 ms. Off for the
+    /// deterministic reel render and under Reduce Motion.
+    var animated = false
     /// Fixed by the single caller (`LeadingOrb`); no `GeometryReader` — reading size would force an
     /// extra layout pass every 100 ms level tick for a value that never changes.
     let size = CGSize(width: 22, height: 16)
@@ -88,6 +92,7 @@ struct Waveform: View {
             }
         }
         .frame(width: size.width, height: size.height)
+        .animation(animated ? .linear(duration: 0.1) : nil, value: samples)   // 0.1 s = the level tick
         .accessibilityHidden(true)   // decorative; state is announced by IndicatorController (IND-3)
     }
 
@@ -140,23 +145,24 @@ struct LeadingOrb: View {
 
     var body: some View {
         if let m = morph {                       // deterministic render (reel / stills)
-            crossfade(morph: m, angle: ((clock ?? 0) / 0.9) * 360)
+            crossfade(morph: m, angle: ((clock ?? 0) / 0.9) * 360, live: false)
         } else {                                 // live
             // Pause the timeline while the spinner is hidden: don't re-render at display refresh rate
             // for the whole recording (battery); it ticks only while spinning.
             TimelineView(.animation(minimumInterval: nil, paused: !spinning)) { tl in
                 let angle = (tl.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 0.9) / 0.9) * 360
-                crossfade(morph: spinning ? 1 : 0, angle: angle)
+                crossfade(morph: spinning ? 1 : 0, angle: angle, live: true)
             }
             .animation(.easeInOut(duration: 0.35), value: spinning)
         }
     }
 
-    private func crossfade(morph: Double, angle: Double) -> some View {
+    private func crossfade(morph: Double, angle: Double, live: Bool) -> some View {
         // Leading-aligned: the spinner ring is narrower than the waveform; centering would push it past
         // the waveform's left edge (the 8pt margin), so align both to the leading edge.
         ZStack(alignment: .leading) {
-            Waveform(levels: levels, level: level, color: Color(nsColor: .systemOrange))
+            Waveform(levels: levels, level: level, color: Color(nsColor: .systemOrange),
+                     animated: live && !reduceMotion)
                 .opacity(1 - morph)
                 .scaleEffect(reduceMotion ? 1 : 1 - 0.35 * morph)
             SpinnerRing(angle: angle)
