@@ -30,13 +30,6 @@ public enum InsertionOutcome: Sendable, Equatable {
 /// the host app's undo.
 @MainActor
 public final class TextInserter {
-    /// Per-app settle delay before/after paste for hosts with restrictive input handling
-    /// (ORA-INS-006). A minimal built-in lookup, NOT a user-facing config surface.
-    private static let settleDelays: [String: Duration] = [
-        "com.apple.Terminal": .milliseconds(30),
-        "com.googlecode.iterm2": .milliseconds(40),
-        "com.github.wez.wezterm": .milliseconds(40),
-    ]
 
     public init() {}
 
@@ -77,11 +70,10 @@ public final class TextInserter {
         //    decides two things: whether we need a separating space (ORA-INS-008), and whether this
         //    dictation starts a sentence. Both come from one read of the caret context — capitalizing
         //    unconditionally upstream is what made a continuation after "hello," come back as "Hello".
-        let delay = target.bundleID.flatMap { Self.settleDelays[$0] }
         let contextBegan = ContinuousClock.now
         let composed = Self.compose(text, after: Self.precedingText(field))
         DebugLog.stage("insert.caretContext", since: contextBegan)
-        return await paste(composed.text, settle: delay, field: field)
+        return await paste(composed.text, field: field)
     }
 
     // MARK: Decisions (pure — table-tested against a fake field)
@@ -179,7 +171,7 @@ public final class TextInserter {
 
     // MARK: Paste
 
-    private func paste(_ text: String, settle: Duration?, field: FocusedField?) async -> InsertionOutcome {
+    private func paste(_ text: String, field: FocusedField?) async -> InsertionOutcome {
         let preValueBegan = ContinuousClock.now
         let preValue = Self.verifiableValue(field)   // for best-effort verification
         DebugLog.stage("insert.preValue", since: preValueBegan)
@@ -190,7 +182,6 @@ public final class TextInserter {
         let ourChangeCount = Pasteboard.writeConcealed(text)
         DebugLog.stage("insert.write", since: writeBegan)
 
-        if let settle { try? await Task.sleep(for: settle) }
         postCommandV()
         DebugLog.stage("stop→⌘V", sinceMark: "stop")
         let postedAt = ContinuousClock.now

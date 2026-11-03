@@ -482,9 +482,11 @@ Invariants (all MUST):
     (e.g. a password manager's copied secret), Orator MUST NOT restore them, and leaves the pasteboard empty:
     a restore would defeat the other app's own timed clear.
   - Fire the completion cue immediately after the paste verifies; clipboard restore MUST NOT block it.
-- ORA-INS-006 (SHOULD): For host applications known to require synthetic paste and/or a longer settle delay
-  (e.g. certain terminal emulators), Orator SHOULD apply the necessary per-application adjustment. This is a
-  minimal built-in lookup, not a user-facing configuration system.
+- ORA-INS-006 (MUST NOT): Orator MUST NOT carry per-application paste delays or other app-specific
+  adjustments without an observed, reproduced failure in that app. Fixed waits for terminal emulators
+  (Terminal 30 ms, iTerm2 / WezTerm 40 ms) shipped in the initial commit as a precaution with no observed
+  failure behind them, and were removed 2026-11-02. A missed paste is caught by verification and routed to
+  recovery, so no text is lost while finding out.
 - ORA-INS-007 (MUST NOT): Orator MUST NOT insert into a secure text field (password fields refuse programmatic
   input); it MUST detect this case and route the result to the recovery buffer with a legible reason.
   Detection uses two independent signals: the focused element's `AXSecureTextField` subrole, and globally-active
