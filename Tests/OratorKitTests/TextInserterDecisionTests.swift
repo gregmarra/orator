@@ -178,6 +178,15 @@ final class TextInserterDecisionTests: XCTestCase {
         XCTAssertEqual(TextInserter.verifiableValue(FakeField(caret: 9, value: long)), long)
     }
 
+    /// Muse focuses an AXButton: value "", no caret, unchanged while its own editor takes the paste.
+    /// A value with no caret isn't a text field's contents, so it's unverifiable, not failed.
+    func testCaretlessElementIsUnverifiable() {
+        let button = FakeField(caret: nil, value: "")
+        XCTAssertNil(TextInserter.verifiableValue(button))
+        XCTAssertEqual(TextInserter.pasteOutcome(preValue: TextInserter.verifiableValue(button), landed: false), .inserted)
+        XCTAssertNil(TextInserter.verifiableValue(FakeField(caret: nil, value: "Send")))
+    }
+
     /// No focused element (Steam / E16): no preValue can be read, so the blind paste counts as inserted.
     func testNilFieldBlindPasteCountsAsInserted() {
         let field: FocusedField? = nil

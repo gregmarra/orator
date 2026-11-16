@@ -137,9 +137,15 @@ public final class TextInserter {
     }
 
     /// The value verification compares before and after ⌘V, or nil when the field can't be verified
-    /// (E16, Chromium, a stand-in field).
+    /// (E16, Chromium, a stand-in field, an element with no caret).
+    ///
+    /// No caret means the focused element isn't a text field at all, so its value says nothing about
+    /// where the paste went. Muse focuses an AXButton whose value is "" and never changes while its
+    /// self-drawn editor takes the text; verifying against it raised "Paste didn't land" on every
+    /// dictation that landed.
     nonisolated static func verifiableValue(_ field: FocusedField?) -> String? {
-        guard let value = field?.value, !isStandIn(value) else { return nil }
+        guard let field, field.caretLocation != nil,
+              let value = field.value, !isStandIn(value) else { return nil }
         return value
     }
 
