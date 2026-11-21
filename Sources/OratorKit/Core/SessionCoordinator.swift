@@ -100,9 +100,7 @@ public final class SessionCoordinator: SpeechResultSink {
         /// Loudest level seen. Diagnostic only: it separates "the mic delivered silence" from "audio
         /// arrived but the recognizer returned nothing", which look identical to the user.
         var peakLevel: Float = 0
-        /// Latency instrumentation (ORA-PERF-004). Speech onset lets the preview be timed from when
-        /// the user started talking rather than from capture start.
-        var speechOnsetAt: ContinuousClock.Instant?
+        /// Latency instrumentation (ORA-PERF-004): each first is timed once from capture start.
         var sawFirstConfirmed = false
         var sawFirstPreviewWords = false
     }
@@ -130,8 +128,6 @@ public final class SessionCoordinator: SpeechResultSink {
     private var bridgeTask: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
     private static let maxFailovers = 2
-    /// ≈ −32 dB on the meter's −50 dB-floor scale: above room noise, below normal speech.
-    private static let speechOnsetLevel: Float = 0.35
 
     /// `now` is injectable so error-expiry and the debounce are testable without wall-clock waits
     /// (same idiom as `RecoveryBuffer`); `timing` so the limits are. All default to production.
@@ -625,9 +621,6 @@ public final class SessionCoordinator: SpeechResultSink {
                 self.elapsed = (ContinuousClock.now - start).milliseconds / 1000   // monotonic seconds
                 self.audioLevel = self.audio.currentLevel
                 self.dictation.peakLevel = max(self.dictation.peakLevel, self.audioLevel)
-                if self.dictation.speechOnsetAt == nil, self.audioLevel >= Self.speechOnsetLevel {
-                    self.dictation.speechOnsetAt = .now   // ±1 tick (100 ms)
-                }
                 if self.elapsed >= self.timing.maxDuration {
                     // Hand off to a FRESH task and leave the loop. Calling finish() inline ran
                     // the whole stop path inside tickTask — which stopTimersAndTaps cancels — so every
@@ -746,7 +739,6 @@ public final class SessionCoordinator: SpeechResultSink {
         if !dictation.sawFirstPreviewWords, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             dictation.sawFirstPreviewWords = true
             if let at = dictation.startInstant { DebugLog.stage("capturing→firstPreviewWords", since: at) }
-            if let at = dictation.speechOnsetAt { DebugLog.stage("speechOnset→firstPreviewWords", since: at) }
         }
         dictation.fastPreview = text
     }
