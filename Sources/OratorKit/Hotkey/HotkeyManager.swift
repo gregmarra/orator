@@ -50,9 +50,6 @@ public final class HotkeyManager {
     private static let handler: EventHandlerUPP = { _, event, userData in
         guard let userData else { return noErr }
         let manager = Unmanaged<HotkeyManager>.fromOpaque(userData).takeUnretainedValue()
-        // How long the press sat in the event queue before reaching us — main-thread work ahead of
-        // it is invisible to every stage that starts inside the handler (ORA-PERF-004).
-        if let event { DebugLog.stage("hotkeyEvent→handler", ms: (GetCurrentEventTime() - GetEventTime(event)) * 1000) }
         manager.onFire()
         return noErr
     }

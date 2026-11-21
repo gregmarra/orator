@@ -16,9 +16,6 @@ public protocol AudioSource: AnyObject {
     /// Whether any audio has arrived yet this session, so the watchdog can tell a device that is still
     /// waking up from one that was working and died.
     var hasDeliveredAudio: Bool { get }
-    /// When the current capture delivered its first buffer — the moment the mic was really live, which
-    /// `start` returning is not (device wake-up happens after it). Latency instrumentation only.
-    var firstBufferAt: ContinuousClock.Instant? { get }
     /// Called when capture cannot continue, so the coordinator aborts rather than leave a dead-mic
     /// recording (ORA-REL-001).
     var onUnrecoverableFailure: (@Sendable (String) -> Void)? { get set }
@@ -34,8 +31,6 @@ public protocol AudioSource: AnyObject {
 }
 
 public extension AudioSource {
-    var firstBufferAt: ContinuousClock.Instant? { nil }
-
     func start(outputFormat: AVAudioFormat) throws -> AsyncStream<AnalyzerInput> {
         try start(outputFormat: outputFormat, excluding: [])
     }

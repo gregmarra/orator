@@ -49,12 +49,6 @@ public final class SessionCoordinator: SpeechResultSink {
     public private(set) var readiness: Readiness = .ready
     public private(set) var elapsed: TimeInterval = 0
     public private(set) var audioLevel: Float = 0
-    /// The volatile tail for the live preview only (ORA-ASR-004); never inserted.
-    public private(set) var volatilePreview: String = ""
-    /// The preview transcriber's running transcript (see `SpeechEngine.makePreviewTranscriber`).
-    /// Display only, and kept apart from `volatilePreview` on purpose: that one is the accurate
-    /// transcriber's tail, which a timed-out finalize inserts — this text must never reach the field.
-    private var fastPreview: String = ""
     /// A legible reason for the most recent failure (E5), surfaced in the menu tooltip.
     public private(set) var lastError: String?
     /// When `lastError` was set — an error is an *event*, not a standing condition, so it stops being
@@ -80,8 +74,39 @@ public final class SessionCoordinator: SpeechResultSink {
     /// Derived menu-bar glyph (ORA-IND-001).
     public var glyph: IndicatorGlyph { .from(state: state, readiness: readiness) }
 
-    // Confirmed accumulator — the sacred text (ORA-SM-002).
-    private var confirmedText: String = ""
+    /// Everything that belongs to ONE dictation. A start and every return to idle replace it whole,
+    /// so no field can carry over from the previous session.
+    private struct Dictation {
+        /// Confirmed accumulator — the sacred text (ORA-SM-002).
+        var confirmedText = ""
+        /// The volatile tail for the live preview only (ORA-ASR-004); never inserted.
+        var volatilePreview = ""
+        /// The preview transcriber's running transcript (see `SpeechEngine.makePreviewTranscriber`).
+        /// Display only, and kept apart from `volatilePreview` on purpose: that one is the accurate
+        /// transcriber's tail, which a timed-out finalize inserts — this text must never reach the field.
+        var fastPreview = ""
+        var target: TargetContext?
+        /// Monotonic recording start instant — drives `elapsed` and the max-duration auto-stop.
+        /// Monotonic (not wall-clock Date) so an NTP/DST/manual clock jump can't skew the timer or
+        /// mis-fire the auto-stop (ORA-SM-013).
+        var startInstant: ContinuousClock.Instant?
+        /// The live engine session, kept so a mid-dictation microphone change can bridge a fresh
+        /// capture stream into the SAME transcription instead of starting over.
+        var sessionToken: SpeechEngine.SessionToken?
+        /// Microphone failovers used so far, so a flapping device can't loop.
+        var failoverCount = 0
+        /// UIDs that already failed; excluded from failover device resolution.
+        var failedDeviceUIDs: Set<String> = []
+        /// Loudest level seen. Diagnostic only: it separates "the mic delivered silence" from "audio
+        /// arrived but the recognizer returned nothing", which look identical to the user.
+        var peakLevel: Float = 0
+        /// Latency instrumentation (ORA-PERF-004). Speech onset lets the preview be timed from when
+        /// the user started talking rather than from capture start.
+        var speechOnsetAt: ContinuousClock.Instant?
+        var sawFirstConfirmed = false
+        var sawFirstPreviewWords = false
+    }
+    private var dictation = Dictation()
 
     // Collaborators. Audio, recognition and insertion are protocol-typed so the state machine can be
     // driven headlessly (see `AudioSource` / `SpeechTranscribing` / `TextInserting`).
@@ -98,45 +123,15 @@ public final class SessionCoordinator: SpeechResultSink {
     private let captureTarget: @MainActor () -> TargetContext?
     private var escapeTap: EscapeTap?
 
-    // Session bookkeeping.
-    private var target: TargetContext?
-    /// Monotonic recording start instant — drives `elapsed` and the max-duration auto-stop. Monotonic
-    /// (not wall-clock Date) so an NTP/DST/manual clock jump can't skew the timer or mis-fire the
-    /// auto-stop (ORA-SM-013).
-    private var startInstant: ContinuousClock.Instant?
     private var lastToggle: Date?
     /// Set synchronously in `toggle()` before the async start, so a second press during start-up
     /// cannot re-enter `startRecording` (closes the reentrancy window; ORA-SM-001/003).
     private var starting = false
     private var bridgeTask: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
-    /// The live engine session, kept so a mid-dictation microphone change can bridge a fresh capture
-    /// stream into the SAME transcription instead of starting over.
-    private var sessionToken: SpeechEngine.SessionToken?
-    /// Microphone failovers used by the current dictation, so a flapping device can't loop.
-    private var failoverCount = 0
     private static let maxFailovers = 2
-    /// UIDs that already failed during this dictation; excluded from failover device resolution.
-    private var failedDeviceUIDs: Set<String> = []
-    /// Loudest level seen this dictation. Diagnostic only: it separates "the mic delivered silence"
-    /// from "audio arrived but the recognizer returned nothing", which look identical to the user.
-    private var peakLevel: Float = 0
-    /// When the level first reached speech (latency instrumentation), so the preview can be timed from
-    /// speech onset rather than from capture start, which includes the pause before the user speaks.
-    private var speechOnsetAt: ContinuousClock.Instant?
-    private var sawFirstPreviewWords = false
     /// ≈ −32 dB on the meter's −50 dB-floor scale: above room noise, below normal speech.
     private static let speechOnsetLevel: Float = 0.35
-    /// Latency instrumentation only (ORA-PERF-004): whether this dictation has produced its first
-    /// volatile / confirmed result yet, so each is timed once from `startInstant`.
-    private var sawFirstVolatile = false
-    private var sawFirstPreview = false
-    private var sawFirstConfirmed = false
-    /// When the recognizer last delivered anything — at stop, the gap says how far behind live it ran.
-    private var lastResultAt: ContinuousClock.Instant?
-    /// When `startRecording` began, and whether this dictation's first mic buffer has been timed yet.
-    private var startBegan: ContinuousClock.Instant?
-    private var timedFirstBuffer = false
 
     /// `now` is injectable so error-expiry and the debounce are testable without wall-clock waits
     /// (same idiom as `RecoveryBuffer`); `timing` so the limits are. All default to production.
@@ -188,29 +183,27 @@ public final class SessionCoordinator: SpeechResultSink {
     /// A second or two of speech is lost across the switch — a seam in the transcript, versus losing
     /// the dictation. Bounded, so a device that flaps can't spin here forever.
     private func attemptFailover() -> Bool {
-        guard failoverCount < Self.maxFailovers,
-              let token = sessionToken,
+        guard dictation.failoverCount < Self.maxFailovers,
+              let token = dictation.sessionToken,
               let format = engine.inputFormat else { return false }
 
         // Retire the device that just failed BEFORE re-resolving. A mic that dies without faulting the
         // session still enumerates and still looks usable, so without this the resolver hands back the
         // same dead device and every attempt is spent on it.
-        if let failed = audio.currentDeviceUID { failedDeviceUIDs.insert(failed) }
+        if let failed = audio.currentDeviceUID { dictation.failedDeviceUIDs.insert(failed) }
         audio.stop()
         bridgeTask?.cancel(); bridgeTask = nil
 
         let stream: AsyncStream<AnalyzerInput>
-        do { stream = try audio.start(outputFormat: format, excluding: failedDeviceUIDs) }
+        do { stream = try audio.start(outputFormat: format, excluding: dictation.failedDeviceUIDs) }
         catch {
             // Only excluded devices left ⇒ there is genuinely nowhere to go; the caller ends the
             // dictation properly rather than burning the remaining attempts.
             Log.session.error("Failover found no usable microphone: \(error.localizedDescription)")
             return false
         }
-        failoverCount += 1
-        bridgeTask = Task.detached { [engine] in
-            for await input in stream { engine.feed(input, for: token) }
-        }
+        dictation.failoverCount += 1
+        bridge(stream, into: token)
         // Deliberately NO user-facing notice: `notice` is a terminal message that replaces the live
         // preview and hides the elapsed timer, so raising one mid-session reads as "the dictation just
         // ended" — the exact signal failover exists to avoid. A working failover should be seamless.
@@ -225,7 +218,7 @@ public final class SessionCoordinator: SpeechResultSink {
         Log.session.error("Session aborted: \(reason)")
         teardownCapture()
         engine.endSession()
-        if !confirmedText.isEmpty { recovery.add(confirmedText, reason: .noTarget) }
+        if !dictation.confirmedText.isEmpty { recovery.add(dictation.confirmedText, reason: .noTarget) }
         setError(reason)
         returnToIdle()
         // An abort that only logged left the user talking into a dead session with no cue and no
@@ -338,11 +331,7 @@ public final class SessionCoordinator: SpeechResultSink {
     /// The per-session state every ending clears, whichever way the session ended (cancel, abort,
     /// finish). Capture and engine teardown differ per path and stay with the caller.
     private func returnToIdle() {
-        confirmedText = ""
-        volatilePreview = ""
-        fastPreview = ""
-        sessionToken = nil
-        startInstant = nil
+        dictation = Dictation()
         state = .idle
     }
 
@@ -371,10 +360,14 @@ public final class SessionCoordinator: SpeechResultSink {
     /// failed start was announced by sound alone. Sound is user-disableable (ORA-FBK-001), which made
     /// the whole class of start failures completely silent AND invisible for anyone with cues off: the
     /// hotkey simply did nothing, with no way to discover why.
+    ///
+    /// Also ends the start attempt (clears `starting`), so no failure path can leave the hotkey
+    /// thinking a start is still in flight.
     private func failStart(_ reason: String) {
         setError(reason)
         showNotice(reason)
         feedback.playError()
+        starting = false
     }
 
     /// Synchronous up to capture start, so a hotkey press reaches the microphone with no main-actor
@@ -387,7 +380,6 @@ public final class SessionCoordinator: SpeechResultSink {
         guard engine.isWarm, let format = engine.inputFormat else {
             Log.session.error("Cannot start: engine not warm")
             Task {
-                defer { starting = false }
                 // A model problem renames itself via readiness; anything else is a transient engine fault.
                 if await downgradeReadinessIfModelUnavailable() { failStart(readiness.shortReason) }
                 else { failStart("Speech engine isn’t ready — try again") }
@@ -401,28 +393,12 @@ public final class SessionCoordinator: SpeechResultSink {
             Log.session.error("Cannot start: microphone permission not granted")
             readiness = .needsPermission(permissions.missing())
             failStart("Mic access is off — see System Settings")
-            starting = false
             return
         }
 
         clearNotice()   // this dictation supersedes the previous one's outcome message
-        failoverCount = 0
-        failedDeviceUIDs = []   // a fresh dictation re-trusts every device
-        peakLevel = 0
-        speechOnsetAt = nil
-        sawFirstPreviewWords = false
-        sawFirstVolatile = false
-        sawFirstPreview = false
-        sawFirstConfirmed = false
-        lastResultAt = nil
-        startBegan = began
-        timedFirstBuffer = false
-        let targetBegan = ContinuousClock.now
-        target = captureTarget()
-        DebugLog.stage("start.captureTarget", since: targetBegan)
-        confirmedText = ""
-        volatilePreview = ""
-        fastPreview = ""
+        // A fresh dictation: empty text, re-trusts every device, zeroed diagnostics.
+        dictation = Dictation(target: captureTarget())
         audioLevel = 0
         elapsed = 0        // reset BEFORE the indicator expands so it never flashes the prior session's time
 
@@ -430,21 +406,18 @@ public final class SessionCoordinator: SpeechResultSink {
         // concurrently rather than gating it. Resolves FBK-001(SHOULD) vs M1(MUST) toward the MUST:
         // a subtle cue that may bleed slightly is acceptable; a 180 ms stall is not.
         let stream: AsyncStream<AnalyzerInput>
-        let audioBegan = ContinuousClock.now
-        defer { DebugLog.stage("start.audioStart", since: audioBegan) }
         do {
             stream = try audio.start(outputFormat: format)
         } catch {
             // Capture failed to start ⇒ stay idle, legible reason on every channel (ORA-SM-004 / E5).
             Log.session.error("Audio start failed: \(error.localizedDescription)")
             failStart("Couldn’t start the microphone.")
-            starting = false
             return
         }
 
         // Enter recording ONLY after capture actually started (ORA-SM-004).
         state = .recording
-        startInstant = ContinuousClock.now
+        dictation.startInstant = ContinuousClock.now
         clearError()
         DebugLog.stage("start→capturing", since: began)   // M1 (ORA-PERF-004)
         feedback.playStart()                                      // non-blocking cue (overlapped)
@@ -456,7 +429,6 @@ public final class SessionCoordinator: SpeechResultSink {
     private func attachSession(_ stream: AsyncStream<AnalyzerInput>) async {
         defer { starting = false }
         let token = await engine.beginSession()
-        if let startInstant { DebugLog.stage("capturing→session", since: startInstant) }
 
         // `beginSession` is a suspension point: a second hotkey press during it runs finish() →
         // teardownCapture concurrently. If we resumed here on a torn-down session we'd wire an orphan
@@ -470,7 +442,6 @@ public final class SessionCoordinator: SpeechResultSink {
             // tear it down. `toggle()`'s `starting` guard means no NEWER session can exist here, so
             // this can only be reaping our own.
             if token != nil { engine.endSession() }
-            sessionToken = nil
             return
         }
 
@@ -481,15 +452,8 @@ public final class SessionCoordinator: SpeechResultSink {
             abortSession(reason: "Couldn’t start transcription.")   // the abort's error + notice explain it
             return
         }
-        sessionToken = token
-
-        // Bridge audio → engine (the audio consumer). Detached so buffers never hop the main actor
-        // (the engine's `feed` is nonisolated). The engine's own single results task (ORA-CC-003)
-        // feeds this coordinator back via SpeechResultSink. The token makes a bridge that outlives its
-        // session a no-op rather than a source of cross-session bleed.
-        bridgeTask = Task.detached { [engine] in
-            for await input in stream { engine.feed(input, for: token) }
-        }
+        dictation.sessionToken = token
+        bridge(stream, into: token)
         startTicking()
         // Defer the Escape event-tap: creating a CGEvent tap is synchronous main-thread work that
         // hitches the indicator's expand animation. Nobody hits Escape in the first ~third of a second,
@@ -499,6 +463,16 @@ public final class SessionCoordinator: SpeechResultSink {
         DispatchQueue.main.asyncAfter(deadline: .now() + escapeDelay) { [weak self] in
             guard let self, self.state == .recording, self.escapeTap == nil else { return }
             self.installEscapeTap()
+        }
+    }
+
+    /// Bridge audio → engine (the audio consumer). Detached so buffers never hop the main actor (the
+    /// engine's `feed` is nonisolated). The engine's own single results task (ORA-CC-003) feeds this
+    /// coordinator back via SpeechResultSink. The token makes a bridge that outlives its session a
+    /// no-op rather than a source of cross-session bleed.
+    private func bridge(_ stream: AsyncStream<AnalyzerInput>, into token: SpeechEngine.SessionToken) {
+        bridgeTask = Task.detached { [engine] in
+            for await input in stream { engine.feed(input, for: token) }
         }
     }
 
@@ -516,38 +490,28 @@ public final class SessionCoordinator: SpeechResultSink {
     private func finish(lossReason: String? = nil) async {
         guard state == .recording else { return }
         let stopped = ContinuousClock.now
-        DebugLog.mark("stop")
-        if let lastResultAt { DebugLog.stage("lastResult→stop", since: lastResultAt) }
         state = .finalizing
         if lossReason != nil {
             teardownCapture()             // discard: the device is gone, nothing more will arrive
         } else {
             await teardownCaptureDraining()   // graceful stop: DRAIN trailing buffers (don't drop them)
         }
-        DebugLog.stage("stop→bridgeDrained", since: stopped)
 
-        let finalizeBegan = ContinuousClock.now
         let finished = await engine.finalize(within: timing.finalizationCap)
-        DebugLog.stage("finalize", since: finalizeBegan)
         DebugLog.stage("stop→final", since: stopped)   // M3
         // Wait until every final the flush produced has reached `speechDidConfirm` (the results task
         // delivers them asynchronously). State stays `.finalizing` here, so those late finals ARE
         // accepted — this closes the drop-the-tail race. A clean finalize ends the results stream,
         // which is an exact signal; without it (timeout, or no signal within the bound) fall back to
         // waiting for the confirmed text to stop growing. Each wait is bounded at 250 ms (inside M2).
-        let drainBegan = ContinuousClock.now
         let drained = finished ? await engine.awaitResultsDrained(within: .milliseconds(250)) : false
         if !drained { await drainConfirmed(upTo: .milliseconds(250)) }
-        DebugLog.stage(drained ? "drain(signal)" : "drain(poll)", since: drainBegan)
-        if let lastResultAt, lastResultAt > finalizeBegan {
-            DebugLog.stage("finalize→lastConfirm", ms: (lastResultAt - finalizeBegan).milliseconds)
-        }
 
         // Tail read AFTER the drain — see `resolveText`.
-        let finalText = TranscriptCleaner.clean(Self.resolveText(confirmed: confirmedText,
-                                                                 tail: volatilePreview,
+        let finalText = TranscriptCleaner.clean(Self.resolveText(confirmed: dictation.confirmedText,
+                                                                 tail: dictation.volatilePreview,
                                                                  finished: finished))
-        volatilePreview = ""
+        dictation.volatilePreview = ""
         engine.endSession()   // drop anything still unfinalized so it can't cross into next session
 
         state = .inserting
@@ -569,7 +533,7 @@ public final class SessionCoordinator: SpeechResultSink {
     /// user stopped it — the text still gets placed, but the user is told what happened to the mic.
     private func insert(_ text: String, timedOut: Bool, lossReason: String? = nil) async {
         guard !text.isEmpty else { emptyResultFeedback(lossReason); return }
-        guard let target else {
+        guard let target = dictation.target else {
             // No target at all — the one case where text genuinely cannot be placed (M4).
             let reason: RecoveryReason = timedOut ? .finalizationTimeout : .noTarget
             recovery.add(Self.standalone(text), reason: reason)
@@ -641,7 +605,7 @@ public final class SessionCoordinator: SpeechResultSink {
     /// leaves NO trace in the unified log, which makes it the hardest failure to diagnose after the
     /// fact — exactly when a user reports "transcription isn't working".
     private func emptyResultFeedback(_ lossReason: String? = nil) {
-        Log.session.notice("Dictation produced no text (elapsed \(self.elapsed, format: .fixed(precision: 1))s, peak level \(self.peakLevel, format: .fixed(precision: 3)))")
+        Log.session.notice("Dictation produced no text (elapsed \(self.elapsed, format: .fixed(precision: 1))s, peak level \(self.dictation.peakLevel, format: .fixed(precision: 3)))")
         // A soft falling tone, not the error sound: hearing nothing is a benign outcome, not a fault.
         // Capture DYING is a fault and keeps `playError`.
         if lossReason == nil { feedback.playNothingHeard() } else { feedback.playError() }
@@ -657,15 +621,13 @@ public final class SessionCoordinator: SpeechResultSink {
         tickTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: interval)
-                guard let self, let start = self.startInstant else { break }
+                guard let self, let start = self.dictation.startInstant else { break }
                 self.elapsed = (ContinuousClock.now - start).milliseconds / 1000   // monotonic seconds
                 self.audioLevel = self.audio.currentLevel
-                self.peakLevel = max(self.peakLevel, self.audioLevel)
-                if self.speechOnsetAt == nil, self.audioLevel >= Self.speechOnsetLevel {
-                    self.speechOnsetAt = .now
-                    DebugLog.stage("capturing→speechOnset", since: start)   // ±1 tick (100 ms)
+                self.dictation.peakLevel = max(self.dictation.peakLevel, self.audioLevel)
+                if self.dictation.speechOnsetAt == nil, self.audioLevel >= Self.speechOnsetLevel {
+                    self.dictation.speechOnsetAt = .now   // ±1 tick (100 ms)
                 }
-                self.timeFirstBuffer()
                 if self.elapsed >= self.timing.maxDuration {
                     // Hand off to a FRESH task and leave the loop. Calling finish() inline ran
                     // the whole stop path inside tickTask — which stopTimersAndTaps cancels — so every
@@ -679,15 +641,6 @@ public final class SessionCoordinator: SpeechResultSink {
                 self.checkCaptureAlive()
             }
         }
-    }
-
-    /// Time from the hotkey reaching `startRecording` to the microphone's first buffer — when capture
-    /// is really live, which `start` returning is not (ORA-PERF-004, M1). Exact despite the 100 ms
-    /// tick: it reads the instant capture stamped, not the tick's own.
-    private func timeFirstBuffer() {
-        guard !timedFirstBuffer, let began = startBegan, let at = audio.firstBufferAt else { return }
-        timedFirstBuffer = true
-        DebugLog.stage("start→firstBuffer", ms: (at - began).milliseconds)
     }
 
     /// Watchdog for capture that dies without an error (ORA-REL-001).
@@ -759,7 +712,7 @@ public final class SessionCoordinator: SpeechResultSink {
         var previous = -1
         var stableTicks = 0
         while ContinuousClock.now < deadline {
-            let count = confirmedText.count
+            let count = dictation.confirmedText.count
             if count == previous {
                 stableTicks += 1
                 if stableTicks >= 2 { break }   // unchanged across two ticks ⇒ drained
@@ -775,39 +728,27 @@ public final class SessionCoordinator: SpeechResultSink {
 
     public func speechDidConfirm(_ text: String) {
         guard state == .recording || state == .finalizing else { return }
-        noteResult(firstOfKind: &sawFirstConfirmed, "capturing→firstConfirmed")
-        confirmedText = Self.joined(confirmedText, text)
-        volatilePreview = ""
+        if !dictation.sawFirstConfirmed, let startInstant = dictation.startInstant {   // ORA-PERF-004
+            dictation.sawFirstConfirmed = true
+            DebugLog.stage("capturing→firstConfirmed", since: startInstant)
+        }
+        dictation.confirmedText = Self.joined(dictation.confirmedText, text)
+        dictation.volatilePreview = ""
     }
 
     public func speechDidReviseVolatile(_ text: String) {
         guard state == .recording else { return }
-        noteResult(firstOfKind: &sawFirstVolatile, "capturing→firstVolatile")
-        volatilePreview = text
+        dictation.volatilePreview = text
     }
 
     public func speechDidRevisePreview(_ text: String) {
         guard state == .recording else { return }
-        if !sawFirstPreview, let startInstant {
-            sawFirstPreview = true
-            DebugLog.stage("capturing→firstPreview", since: startInstant)
+        if !dictation.sawFirstPreviewWords, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            dictation.sawFirstPreviewWords = true
+            if let at = dictation.startInstant { DebugLog.stage("capturing→firstPreviewWords", since: at) }
+            if let at = dictation.speechOnsetAt { DebugLog.stage("speechOnset→firstPreviewWords", since: at) }
         }
-        if !sawFirstPreviewWords, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            sawFirstPreviewWords = true
-            if let startInstant { DebugLog.stage("capturing→firstPreviewWords", since: startInstant) }
-            if let speechOnsetAt { DebugLog.stage("speechOnset→firstPreviewWords", since: speechOnsetAt) }
-        }
-        fastPreview = text
-    }
-
-    /// Latency bookkeeping for a recognizer result (ORA-PERF-004): time the first of each kind from
-    /// capture start, and stamp the latest so stop can report how far the recognizer trailed.
-    private func noteResult(firstOfKind seen: inout Bool, _ stage: String) {
-        let at = ContinuousClock.now
-        lastResultAt = at
-        guard !seen, let startInstant else { return }
-        seen = true
-        DebugLog.stage(stage, ms: (at - startInstant).milliseconds)
+        dictation.fastPreview = text
     }
 
     // MARK: Indicator content
@@ -820,9 +761,10 @@ public final class SessionCoordinator: SpeechResultSink {
         // accurate confirmed words followed by the preview's words past them (`PreviewSplice`), so
         // earlier words upgrade to the accurate wording as it arrives. The accurate text is what gets
         // inserted either way.
-        let tail = fastPreview.isEmpty
-            ? [confirmedText, volatilePreview].filter { !$0.isEmpty }.joined(separator: " ")
-            : PreviewSplice.compose(confirmed: confirmedText, preview: fastPreview)
+        let d = dictation
+        let tail = d.fastPreview.isEmpty
+            ? [d.confirmedText, d.volatilePreview].filter { !$0.isEmpty }.joined(separator: " ")
+            : PreviewSplice.compose(confirmed: d.confirmedText, preview: d.fastPreview)
         return IndicatorContent(state: state, elapsed: elapsed,
                                 level: audioLevel, previewTail: tail, isNotch: false,
                                 notice: notice)

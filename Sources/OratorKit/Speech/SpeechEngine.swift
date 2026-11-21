@@ -130,19 +130,12 @@ public final class SpeechEngine: SpeechTranscribing {
         let continuation: AsyncStream<AnalyzerInput>.Continuation
         /// The preview analyzer's input; every buffer goes to both.
         let previewContinuation: AsyncStream<AnalyzerInput>.Continuation?
-        /// Latency instrumentation only (ORA-PERF-004): how much audio actually reached the analyzer,
-        /// and when the first of it did — separating "no audio arrived" from "the analyzer was silent".
-        var secondsFed: Double = 0
-        var firstFeedAt: ContinuousClock.Instant?
     }
     private let activeInput = OSAllocatedUnfairLock<ActiveInput?>(initialState: nil)
     private var nextSessionID: UInt64 = 0
     private var resultsTask: Task<Void, Never>?
     private var previewAnalyzer: SpeechAnalyzer?
     private var previewTask: Task<Void, Never>?
-    /// Latency instrumentation only: when the live session started and when its finalize began.
-    private var sessionBeganAt: ContinuousClock.Instant?
-    private var finalizeBeganAt: ContinuousClock.Instant?
 
     /// The analyzer's chosen input format; AudioCapture converts to this.
     public private(set) var inputFormat: AVAudioFormat?
@@ -318,9 +311,7 @@ public final class SpeechEngine: SpeechTranscribing {
         preparingSpare = true
         Task { [weak self] in
             guard let self else { return }
-            let began = ContinuousClock.now
             let session = await self.makePreparedSession()
-            DebugLog.stage("sparePrepare", since: began)
             self.spare = session
             self.preparingSpare = false
         }
@@ -343,20 +334,14 @@ public final class SpeechEngine: SpeechTranscribing {
 
         // Take the ready spare (the common, instant path); only build one inline if none is ready —
         // e.g. very fast back-to-back dictations before the background prepare finished.
-        let began = ContinuousClock.now
         let session: PreparedSession
         if let s = spare { session = s; spare = nil }
-        else if let s = await makePreparedSession() {
-            session = s
-            DebugLog.stage("beginSession.inlinePrepare", since: began)   // spare miss: slow path
-        }
+        else if let s = await makePreparedSession() { session = s }
         else {
             Log.speech.error("beginSession: no analyzer session could be prepared")
             return nil
         }
 
-        let startBegan = ContinuousClock.now
-        defer { DebugLog.stage("beginSession.analyzerStart", since: startBegan) }
         do { try await session.analyzer.start(inputSequence: session.stream) }
         catch {
             Log.speech.error("beginSession start failed: \(error.localizedDescription)")
@@ -367,14 +352,10 @@ public final class SpeechEngine: SpeechTranscribing {
         nextSessionID += 1
         let token = SessionToken(id: nextSessionID)
         self.analyzer = session.analyzer
-        sessionBeganAt = ContinuousClock.now
-        finalizeBeganAt = nil
 
         // The preview starts after the accurate session, so it can never fail a start; a preview
         // analyzer that won't start just leaves the accurate volatiles driving the preview.
         var previewInput: AsyncStream<AnalyzerInput>.Continuation?
-        let previewBegan = ContinuousClock.now
-        defer { if session.preview != nil { DebugLog.stage("beginSession.previewStart", since: previewBegan) } }
         if let preview = session.preview {
             do {
                 try await preview.analyzer.start(inputSequence: preview.stream)
@@ -416,7 +397,6 @@ public final class SpeechEngine: SpeechTranscribing {
             } catch {
                 Log.speech.error("results stream ended with error: \(error.localizedDescription)")
             }
-            if let began = self?.finalizeBeganAt { DebugLog.stage("finalize→resultsEnded", since: began) }
         }
     }
 
@@ -450,8 +430,6 @@ public final class SpeechEngine: SpeechTranscribing {
             guard active?.token == token else { return }
             active?.continuation.yield(input)
             active?.previewContinuation?.yield(input)
-            active?.secondsFed += input.bufferDuration.seconds
-            if active?.firstFeedAt == nil { active?.firstFeedAt = ContinuousClock.now }
         }
     }
 
@@ -461,22 +439,16 @@ public final class SpeechEngine: SpeechTranscribing {
     /// the caller drains late finals first, then calls `endSession()`.
     public func finalize(within cap: Duration) async -> Bool {
         guard let analyzer else { return true }
-        finalizeBeganAt = ContinuousClock.now
         // Signal end-of-input so finalization can complete. Leave the token in place: the bridge is
         // already drained by the caller, and clearing it here would be indistinguishable from teardown.
-        let fed = activeInput.withLock { active in
+        activeInput.withLock { active in
             active?.continuation.finish()
             active?.previewContinuation?.finish()
-            return active.map { ($0.secondsFed, $0.firstFeedAt) }
         }
         // Recording is over, so the preview has nothing left to show. Its input is already finished
         // above; stop forwarding its results, but leave its analyzer's teardown to `endSession`, off
         // the stop path.
         previewTask?.cancel(); previewTask = nil
-        if let (seconds, firstAt) = fed {
-            DebugLog.stage("audioFed", ms: seconds * 1000)
-            if let firstAt, let began = sessionBeganAt { DebugLog.stage("session→firstFeed", ms: (firstAt - began).milliseconds) }
-        }
         // Race finalize against a HARD timeout, resuming on whichever finishes first WITHOUT awaiting
         // the other. A wedged `analyzer.finalize` does not respond to cancellation, and awaiting it
         // (as `withTaskGroup` does) blocks forever — which froze the coordinator in `.finalizing`. If
@@ -532,12 +504,8 @@ public final class SpeechEngine: SpeechTranscribing {
         finishActiveInput()
         let old = analyzer
         analyzer = nil
-        let began = ContinuousClock.now
         Task { [weak self] in
-            if let old {
-                await Self.finishBounded(old)
-                DebugLog.stage("teardown.oldFinished", since: began)
-            }
+            if let old { await Self.finishBounded(old) }
             if queueingSpare { self?.ensureSpare() }
         }
     }

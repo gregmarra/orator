@@ -26,7 +26,6 @@ private final class CaptureSink: NSObject, AVCaptureAudioDataOutputSampleBufferD
     /// before any conversion so a converter failure still counts as "audio is arriving".
     private let lastBufferBox: OSAllocatedUnfairLock<ContinuousClock.Instant?>
     private let hasDeliveredBox: OSAllocatedUnfairLock<Bool>
-    private let firstBufferBox: OSAllocatedUnfairLock<ContinuousClock.Instant?>
     private let clipBox: OSAllocatedUnfairLock<ContinuousClock.Instant?>
     /// One-shot so a per-buffer failure can't flood the log.
     private var loggedConvertFailure = false
@@ -38,14 +37,12 @@ private final class CaptureSink: NSObject, AVCaptureAudioDataOutputSampleBufferD
     init(outputFormat: AVAudioFormat?, levelBox: OSAllocatedUnfairLock<Float>,
          lastBufferBox: OSAllocatedUnfairLock<ContinuousClock.Instant?>,
          hasDeliveredBox: OSAllocatedUnfairLock<Bool>,
-         firstBufferBox: OSAllocatedUnfairLock<ContinuousClock.Instant?>,
          clipBox: OSAllocatedUnfairLock<ContinuousClock.Instant?>,
          yield: @escaping @Sendable (AnalyzerInput) -> Void) {
         self.converter = outputFormat.map(PCMConverter.init(outputFormat:))
         self.levelBox = levelBox
         self.lastBufferBox = lastBufferBox
         self.hasDeliveredBox = hasDeliveredBox
-        self.firstBufferBox = firstBufferBox
         self.clipBox = clipBox
         self.yield = yield
     }
@@ -70,7 +67,6 @@ private final class CaptureSink: NSObject, AVCaptureAudioDataOutputSampleBufferD
         // the delivered format — the three facts every silent-capture report needs.
         if !loggedFirstBuffer {
             loggedFirstBuffer = true
-            firstBufferBox.withLock { $0 = ContinuousClock.now }
             Log.audio.notice("First buffer: format=\(pcm.format, privacy: .public) frames=\(pcm.frameLength) afterStart=\((ContinuousClock.now - self.installedAt).milliseconds, format: .fixed(precision: 1), privacy: .public)ms rawRMS=\(PCMConverter.rms(pcm), format: .fixed(precision: 4), privacy: .public)")
         }
         guard let converter else {
@@ -161,10 +157,6 @@ public final class AudioCapture {
     /// it to pick between the generous startup budget and the tight steady-state one.
     public var hasDeliveredAudio: Bool { hasDeliveredBox.withLock { $0 } }
 
-    /// When this capture's first buffer arrived (latency instrumentation; ORA-PERF-004).
-    private let firstBufferBox = OSAllocatedUnfairLock<ContinuousClock.Instant?>(initialState: nil)
-    public var firstBufferAt: ContinuousClock.Instant? { firstBufferBox.withLock { $0 } }
-
     /// Instant of the most recent clipped buffer, written on the capture queue.
     private let clipBox = OSAllocatedUnfairLock<ContinuousClock.Instant?>(initialState: nil)
     /// True when input hit the rails recently. Clipping is measured on the RAW buffer — it happens at
@@ -229,16 +221,10 @@ public final class AudioCapture {
     private func beginCapture(outputFormat: AVAudioFormat?,
                               excluding: Set<String>) throws -> AsyncStream<AnalyzerInput> {
         guard !running else { throw CaptureError.sessionStartFailed("already running") }
-        let resolveBegan = ContinuousClock.now
         guard let device = Self.resolveChoice(excluding: excluding).device else { throw CaptureError.noInputDevice }
-        DebugLog.stage("capture.resolveDevice", since: resolveBegan)
-        let inputBegan = ContinuousClock.now
         let input: AVCaptureDeviceInput
         do { input = try AVCaptureDeviceInput(device: device) }
         catch { throw CaptureError.sessionStartFailed(error.localizedDescription) }
-        DebugLog.stage("capture.deviceInput", since: inputBegan)
-        let logBegan = ContinuousClock.now
-        defer { DebugLog.stage("capture.restOfStart", since: logBegan) }
         currentDeviceUID = device.uniqueID
         // The single line that answers "which mic, in what format, converting to what?" — the three
         // facts every silent-capture report needs and none of which were previously recoverable.
@@ -250,10 +236,8 @@ public final class AudioCapture {
         // delivers a single buffer is detected on the same timer as one that stops mid-recording.
         lastBufferBox.withLock { $0 = ContinuousClock.now }
         hasDeliveredBox.withLock { $0 = false }
-        firstBufferBox.withLock { $0 = nil }
         let sink = CaptureSink(outputFormat: outputFormat, levelBox: levelBox,
                                lastBufferBox: lastBufferBox, hasDeliveredBox: hasDeliveredBox,
-                               firstBufferBox: firstBufferBox,
                                clipBox: clipBox, yield: { cont.yield($0) })
         self.sink = sink
         output.setSampleBufferDelegate(sink, queue: captureQueue)
@@ -282,10 +266,7 @@ public final class AudioCapture {
         nonisolated(unsafe) let captureSession = session
         nonisolated(unsafe) let captureOutput = output
         nonisolated(unsafe) let addedInput = input
-        let queuedAt = ContinuousClock.now
         sessionQueue.async {
-            DebugLog.stage("capture.queueWait", since: queuedAt)
-            let configBegan = ContinuousClock.now
             // No input to remove first: `stop` detaches, `running` gates re-entry, and both run on
             // this same serial queue — so the session always arrives here empty.
             captureSession.beginConfiguration()
@@ -296,10 +277,7 @@ public final class AudioCapture {
                 else { Log.audio.error("Cannot add audio output") }
             }
             captureSession.commitConfiguration()
-            DebugLog.stage("capture.configure", since: configBegan)
-            let runBegan = ContinuousClock.now
             captureSession.startRunning()
-            DebugLog.stage("capture.startRunning", since: runBegan)
         }
         running = true
         observeRuntimeErrors()
