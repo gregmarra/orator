@@ -339,7 +339,9 @@ final class CrossSessionTests: XCTestCase {
     @MainActor
     func testBackToBackSessionsDoNotLeakOrDrop() async throws {
         let a = try sayToFile("the silver wolf howls beneath the moon", "orator-sessA.aiff")
-        let b = try sayToFile("alpha bravo charlie delta echo", "orator-sessB.aiff")
+        // Plain prose, not the NATO alphabet: the recognizer fused "delta echo" into "deltoneco" on
+        // the macOS 27 `say` voice, which failed the truncation check with nothing truncated.
+        let b = try sayToFile("the red kite circles over the open field", "orator-sessB.aiff")
         let engine = try await warmEngine()
 
         // `transcribe` IS the coordinator's sequence (start → beginSession → bridge → finalize →
@@ -352,11 +354,11 @@ final class CrossSessionTests: XCTestCase {
             XCTAssertFalse(t2.isEmpty, "round \(round): session B dropped (produced nothing)")
             // No truncation: the LAST word of each utterance must be present.
             XCTAssertTrue(t1.contains("moon"), "round \(round): session A truncated — got '\(t1)'")
-            XCTAssertTrue(t2.contains("echo"), "round \(round): session B truncated — got '\(t2)'")
+            XCTAssertTrue(t2.contains("field"), "round \(round): session B truncated — got '\(t2)'")
             // No leak: A's words must not appear in B's transcript and vice-versa.
             XCTAssertFalse(t2.contains("wolf") || t2.contains("moon"),
                            "round \(round): session A leaked into B — got '\(t2)'")
-            XCTAssertFalse(t1.contains("bravo") || t1.contains("charlie"),
+            XCTAssertFalse(t1.contains("kite") || t1.contains("field"),
                            "round \(round): session B leaked into A — got '\(t1)'")
         }
     }
